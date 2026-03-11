@@ -1,33 +1,40 @@
-# Python cache
+# --- Python ---
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Database files (容量削減のため一括除外)
+# --- Database & Data (容量削減・バイナリ除外) ---
 *.db
 *.sqlite3
+data/
+backup/data/
 
-# Logs
+# --- Logs ---
 logs/
 *.log
+agent/logs/
 
-# Scraping data & Assets
-images/pedigree/
-data/
-backup/
+# --- Scraping Assets & Results ---
+# スクレイピング結果や出力ファイルを除外
 results/
+
+# --- Temporary & Backup ---
+# 過去のソースコードやバックアップを除外
+backup/
 old/
 
-# IDE settings
+# --- IDE & OS ---
 .vscode/
-
-# OS files
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# AI Agent logs
-agent/logs/
-# AI Agent cache
+# --- User Request: Exclude specific directories ---
+# ご要望通り、以下のディレクトリを完全に除外します
+docs/other/
+images/
+tests/
+
+# --- AI Agent cache ---
 agent/cache/
-
-# Other
-docs\other
