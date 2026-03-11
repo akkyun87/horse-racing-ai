@@ -1,0 +1,29 @@
+# config/data_config.yaml
+
+# データ収集期間
+data:
+  start_date: "2025-11-01"
+  end_date: "2025-11-30"
+
+# スクレイピング設定
+scraping:
+  base_url: "https://www.jbis.or.jp"
+  request_interval: 3.0               # 通常リクエスト間隔（秒）
+  retry_interval: 2.0                 # リトライ時の待機時間（秒）
+  max_retries: 5                      # リトライ回数
+  timeout: 10                         # タイムアウト（秒）
+  max_workers: 8                      # 並列処理数
+
+# 出力設定
+output:
+  race_data_dir: "data/raw/race"          # 競走成績情報保存先
+  pedigree_data_dir: "data/raw/pedigree"  # 血統情報保存先
+  log_dir: "logs"
+  log_file_name: "data_collection_log.log"
+
+# ログ設定
+logging:
+  level: "INFO" # INFO / DEBUG / WARNING / ERROR
+  rotation: true         # ログローテーションを有効にするか
+  max_bytes: 10485760    # ローテーション閾値 (10MB)
+  backup_count: 5        # 保存世代数

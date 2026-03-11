@@ -1,0 +1,15 @@
+[MASTER]
+# Python ファイルを解析するパス（省略可）
+ignore=tests
+
+[MESSAGES CONTROL]
+# 無効化する警告
+disable=broad-exception-caught, missing-docstring, invalid-name
+
+[FORMAT]
+# 最大行長
+max-line-length=120
+
+[REPORTS]
+# 最終レポートを出さない
+reports=no

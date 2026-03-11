@@ -1,0 +1,33 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Database files (容量削減のため一括除外)
+*.db
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# Scraping data & Assets
+images/pedigree/
+data/
+backup/
+results/
+old/
+
+# IDE settings
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# AI Agent logs
+agent/logs/
+# AI Agent cache
+agent/cache/
+
+# Other
+docs\other

@@ -1,0 +1,237 @@
+# config\lineage.yaml
+
+lineages:
+  # ===============================
+  # 主流系統
+  # ===============================
+  Main_Lines:
+    name: "主流系統"
+    founder: null
+    sub_lineages:
+      Northern_Dancer_Line:
+        name: "Northern Dancer 系"
+        founder: "Northern Dancer"
+        lineage_id: "ND"
+        sub_lineages:
+          Nijinsky_Line:
+            name: "Nijinsky 系"
+            founder: "Nijinsky"
+            lineage_id: "ND-NJ"
+            sub_lineages: {}
+          Vice_Regent_Line:
+            name: "Vice Regent 系"
+            founder: "Vice Regent"
+            lineage_id: "ND-VR"
+            sub_lineages: {}
+          Lyphard_Line:
+            name: "Lyphard 系"
+            founder: "Lyphard"
+            lineage_id: "ND-LY"
+            sub_lineages: {}
+          Danzig_Line:
+            name: "Danzig 系"
+            founder: "Danzig"
+            lineage_id: "ND-DA"
+            sub_lineages: {}
+          Nureyev_Line:
+            name: "Nureyev 系"
+            founder: "Nureyev"
+            lineage_id: "ND-NR"
+            sub_lineages: {}
+          Storm_Cat_Line:
+            name: "Storm Cat 系"
+            founder: "Storm Cat"
+            lineage_id: "ND-SC"
+            sub_lineages: {}
+          Sadlers_Wells_Line:
+            name: "Sadler's Wells 系"
+            founder: "Sadler's Wells"
+            lineage_id: "ND-SW"
+            sub_lineages: {}
+
+      Mr_Prospector_Line:
+        name: "Mr. Prospector 系"
+        founder: "Mr. Prospector"
+        lineage_id: "MP"
+        sub_lineages:
+          Fappiano_Line:
+            name: "Fappiano 系"
+            founder: "Fappiano"
+            lineage_id: "MP-FA"
+            sub_lineages: {}
+          Gone_West_Line:
+            name: "Gone West 系"
+            founder: "Gone West"
+            lineage_id: "MP-GW"
+            sub_lineages: {}
+          Forty_Niner_Line:
+            name: "Forty Niner 系"
+            founder: "Forty Niner"
+            lineage_id: "MP-FN"
+            sub_lineages: {}
+          Kingmambo_Line:
+            name: "Kingmambo 系"
+            founder: "Kingmambo"
+            lineage_id: "MP-KM"
+            sub_lineages:
+              Kingkamehameha_Line:
+                name: "Kingkamehameha 系"
+                founder: "キングカメハメハ"
+                lineage_id: "MP-KG-KK"
+                sub_lineages: {}
+          Smart_Strike_Line:
+            name: "Smart Strike 系"
+            founder: "Smart Strike"
+            lineage_id: "MP-SS"
+            sub_lineages: {}
+          Machiavellian_Line:
+            name: "Machiavellian 系"
+            founder: "Machiavellian"
+            lineage_id: "MP-MA"
+            sub_lineages: {}
+
+      Nasrullah_Line:
+        name: "Nasrullah 系"
+        founder: "Nasrullah"
+        lineage_id: "NA"
+        sub_lineages:
+          Grey_Sovereign_Line:
+            name: "Grey Sovereign 系"
+            founder: "Grey Sovereign"
+            lineage_id: "NA-GS"
+            sub_lineages: {}
+          Bold_Ruler_Line:
+            name: "Bold Ruler 系"
+            founder: "Bold Ruler"
+            lineage_id: "NA-BR"
+            sub_lineages: {}
+          Never_Bend_Line:
+            name: "Never Bend 系"
+            founder: "Never Bend"
+            lineage_id: "NA-NB"
+            sub_lineages: {}
+          Red_God_Line:
+            name: "Red God 系"
+            founder: "Red God"
+            lineage_id: "NA-RG"
+            sub_lineages: {}
+          Princely_Gift_Line:
+            name: "Princely Gift 系"
+            founder: "Princely Gift"
+            lineage_id: "NA-PG"
+            sub_lineages: {}
+
+      Royal_Charger_Line:
+        name: "Royal Charger 系"
+        founder: "Royal Charger"
+        lineage_id: "RC"
+        sub_lineages:
+          Halo_Line:
+            name: "Halo 系"
+            founder: "Halo"
+            lineage_id: "RC-HA"
+            sub_lineages:
+              Sunday_Silence_Line:
+                name: "Sunday Silence 系"
+                founder: "Sunday Silence"
+                lineage_id: "RC-SS"
+                sub_lineages:
+                  Deep_Impact_Line:
+                    name: "Deep Impact 系"
+                    founder: "ディープインパクト"
+                    lineage_id: "RC-DI"
+                    sub_lineages: {}
+          Roberto_Line:
+            name: "Roberto 系"
+            founder: "Roberto"
+            lineage_id: "RC-RO"
+            sub_lineages: {}
+          Sir_Gaylord_Line:
+            name: "Sir Gaylord 系"
+            founder: "Sir Gaylord"
+            lineage_id: "RC-SG"
+            sub_lineages: {}
+
+  # ===============================
+  # 非主流系統
+  # ===============================
+  Non_Main_Lines:
+    name: "非主流系統"
+    founder: null
+    sub_lineages:
+      Herod_Line:
+        name: "Herod 系"
+        founder: "Herod"
+        lineage_id: "HE"
+        sub_lineages: {}
+
+      Touchstone_Line:
+        name: "Touchstone 系"
+        founder: "Touchstone"
+        lineage_id: "TS"
+        sub_lineages:
+          Himyar_Line:
+            name: "Himyar 系"
+            founder: "Himyar"
+            lineage_id: "TS-HI"
+            sub_lineages: {}
+          Hyperion_Line:
+            name: "Hyperion 系"
+            founder: "Hyperion"
+            lineage_id: "TS-HY"
+            sub_lineages: {}
+
+      Stockwell_Line:
+        name: "Stockwell 系"
+        founder: "Stockwell"
+        lineage_id: "ST"
+        sub_lineages:
+          Orme_Line:
+            name: "Orme 系"
+            founder: "Orme"
+            lineage_id: "ST-OR"
+            sub_lineages: {}
+          Damascus_Line:
+            name: "Damascus 系"
+            founder: "Damascus"
+            lineage_id: "ST-DA"
+            sub_lineages: {}
+
+      Phalaris_Line:
+        name: "Phalaris 系"
+        founder: "Phalaris"
+        lineage_id: "PH"
+        sub_lineages:
+          Tom_Fool_Line:
+            name: "Tom Fool 系"
+            founder: "Tom Fool"
+            lineage_id: "PH-TF"
+            sub_lineages: {}
+
+      Blandford_Line:
+        name: "Blandford 系"
+        founder: "Blandford"
+        lineage_id: "BL"
+        sub_lineages: {}
+
+      St_Simon_Line:
+        name: "St. Simon 系"
+        founder: "St. Simon"
+        lineage_id: "SS"
+        sub_lineages:
+          Princequillo_Line:
+            name: "Princequillo 系"
+            founder: "Princequillo"
+            lineage_id: "SS-PR"
+            sub_lineages: {}
+          Ribot_Line:
+            name: "Ribot 系"
+            founder: "Ribot"
+            lineage_id: "SS-RI"
+            sub_lineages: {}
+
+      Matchem_Line:
+        name: "Matchem 系"
+        founder: "Matchem"
+        lineage_id: "MA"
+        sub_lineages: {}

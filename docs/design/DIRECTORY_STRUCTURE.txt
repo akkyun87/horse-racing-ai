@@ -1,0 +1,206 @@
+Folder PATH listing for volume Windows
+Volume serial number is 88C9-1F07
+C:.
+|   .gitignore
+|   .pylintrc
+|   main.py
+|   REAMDME.md
+|   requirements.txt
+|   
++---.vscode
+|       settings.json
+|       
++---agent
+|   |   instructions.md
+|   |   memorymd
+|   |   progress.md
+|   |   project_context.md
+|   |   
+|   +---logs
+|   \---prompts
+|           program_design.md
+|           refactoring.md
+|           system_agent.md
+|           
++---backup
+|   +---data
+|   |   +---processed
+|   |   +---raw
+|   |   |   +---pedigree
+|   |   |   |       pedigree.db
+|   |   |   |       sire_lineage.db
+|   |   |   |       
+|   |   |   \---race
+|   |   |           race.db
+|   |   |           
+|   |   +---stats
+|   |   \---urls
+|   \---data_pipeline
+|       |   data_loader.py
+|       |   data_models.py
+|       |   data_validator.py
+|       |   pedigree_scraper.py
+|       |   race_detail_scraper.py
+|       |   race_list_scraper.py
+|       |   
+|       \---__pycache__
+|               data_loader.cpython-312.pyc
+|               data_models.cpython-312.pyc
+|               data_validator.cpython-312.pyc
+|               pedigree_lineage_parser.cpython-312.pyc
+|               pedigree_lineage_scraper.cpython-312.pyc
+|               pedigree_scraper.cpython-312.pyc
+|               race_detail_scraper.cpython-312.pyc
+|               race_list_scraper.cpython-312.pyc
+|               
++---config
+|       data_loader_config.yaml
+|       lineage.yaml
+|       
++---data
+|   +---processed
+|   +---raw
+|   |   +---pedigree
+|   |   |       pedigree.db
+|   |   |       sire_lineage.db
+|   |   |       
+|   |   \---race
+|   |           race.db
+|   |           
+|   +---stats
+|   \---urls
+|       \---2025
+|           +---12
+|           |       race_list_2025-12.json
+|           |       
+|           \---6
+|                   race_list_2025-06.json
+|                   
++---docs
+|   +---design
+|   |       DATABASE_DESIGN.md
+|   |       DIRECTORY_STRUCTURE.txt
+|   |       PROGRAM_DESIGN.md
+|   |       SYSTEM_DESIGN.md
+|   |       
+|   \---other
+|           GIT_PROMPT.md
+|           memo.md
+|           programmemo.txt
+|           PROMPT.md
+|           
++---images
+|   +---drawio
+|   |       data_pipeline_architecture.png
+|   |       drawio.drawio
+|   |       
+|   +---img
+|   \---pedigree
+|       +---html
+|       |       0001352760.html
+|       |       
+|       \---img
+|               0001352760.png
+|               
++---logs
++---models
++---old
+|   \---20251227_data_pipeline_src
+|       +---data_pipeline
+|       |   |   data_loader.py
+|       |   |   data_models.py
+|       |   |   data_validator.py
+|       |   |   pedigree_lineage_scraper.py
+|       |   |   pedigree_scraper.py
+|       |   |   race_detail_scraper.py
+|       |   |   race_list_scraper.py
+|       |   |   
+|       |   \---__pycache__
+|       |           data_loader.cpython-312.pyc
+|       |           data_models.cpython-312.pyc
+|       |           data_validator.cpython-312.pyc
+|       |           pedigree_lineage_parser.cpython-312.pyc
+|       |           pedigree_lineage_scraper.cpython-312.pyc
+|       |           pedigree_scraper.cpython-312.pyc
+|       |           race_detail_scraper.cpython-312.pyc
+|       |           race_list_scraper.cpython-312.pyc
+|       |           
+|       +---data_processing
+|       |       get_lineage.py
+|       |       
+|       +---model
+|       +---training
+|       \---utils
+|           |   db_manager.py
+|           |   file_manager.py
+|           |   logger.py
+|           |   retry_requests.py
+|           |   
+|           \---__pycache__
+|                   db_manager.cpython-312.pyc
+|                   file_manager.cpython-312.pyc
+|                   logger.cpython-312.pyc
+|                   retry_requests.cpython-312.pyc
+|                   
++---results
++---scripts
++---src
+|   +---data_pipeline
+|   |   |   data_loader.py
+|   |   |   data_models.py
+|   |   |   data_validator.py
+|   |   |   pedigree_scraper.py
+|   |   |   race_detail_scraper.py
+|   |   |   race_list_scraper.py
+|   |   |   
+|   |   \---__pycache__
+|   |           data_loader.cpython-312.pyc
+|   |           data_models.cpython-312.pyc
+|   |           data_validator.cpython-312.pyc
+|   |           pedigree_lineage_parser.cpython-312.pyc
+|   |           pedigree_lineage_scraper.cpython-312.pyc
+|   |           pedigree_scraper.cpython-312.pyc
+|   |           race_detail_scraper.cpython-312.pyc
+|   |           race_list_scraper.cpython-312.pyc
+|   |           
+|   +---features
+|   |   |   dataset_builder.py
+|   |   |   feature_joiner.py
+|   |   |   horse_features.py
+|   |   |   lineage_features.py
+|   |   |   pedigree_features.py
+|   |   |   race_features.py
+|   |   |   
+|   |   \---__pycache__
+|   |           horse_features.cpython-312.pyc
+|   |           lineage_features.cpython-312.pyc
+|   |           pedigree_features.cpython-312.pyc
+|   |           race_features.cpython-312.pyc
+|   |           
+|   +---model
+|   +---training
+|   \---utils
+|       |   db_manager.py
+|       |   file_manager.py
+|       |   inbreeding_calculator.py
+|       |   logger.py
+|       |   pedigree_visualizer.py
+|       |   retry_requests.py
+|       |   
+|       \---__pycache__
+|               db_manager.cpython-312.pyc
+|               file_manager.cpython-312.pyc
+|               logger.cpython-312.pyc
+|               pedigree_visualizer.cpython-312.pyc
+|               retry_requests.cpython-312.pyc
+|               
+\---tests
+    |   test.html
+    |   test.py
+    |   test_data.json
+    |   test_data.yaml
+    |   test_db.db
+    |   
+    \---__pycache__
+            test.cpython-312.pyc
+            
