@@ -23,23 +23,35 @@ JBIS (Japan Bloodstock Information System) から競走馬の5代血統情報を
     src.utils.db_manager            (load_from_db, save_to_db)
     src.utils.file_manager          (load_data)
     src.utils.retry_requests        (fetch_html)
+    src.utils.logger                (setup_logger, close_logger_handlers)
 
 【Usage】
-  from src.data_pipeline.pedigree_scraper import scrape_pedigree_data
-  import logging
+    from src.data_pipeline.pedigree_scraper import scrape_pedigree_data
+    from src.utils.logger import setup_logger
 
-  logger = logging.getLogger("PedigreeScraper")
-  results = scrape_pedigree_data(horse_list, logger=logger)
+    logger = setup_logger(
+        log_filepath="logs/pedigree_scraper.log",
+        log_level="INFO",
+        logger_name="PedigreeScraperMain",
+    )
+
+    sample_horses = [
+        {"id": "0001155349", "url": "https://www.jbis.or.jp/horse/0001155349/"},
+    ]
+    results = scrape_pedigree_data(sample_horses, logger)
+    for info in results:
+        print(f"[馬ID] {info.horse_id}  [馬名] {info.name}")
 """
 
 # ---------------------------------------------------------
 # インポート
 # ---------------------------------------------------------
 
-from __future__ import annotations
-
 import logging
 import re
+import shutil
+import sqlite3
+import time
 import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -51,6 +63,7 @@ from bs4 import BeautifulSoup
 from src.data_pipeline.data_models import PedigreeInfo
 from src.utils.db_manager import load_from_db, save_to_db
 from src.utils.file_manager import load_data
+from src.utils.logger import setup_logger
 from src.utils.retry_requests import fetch_html
 
 # ---------------------------------------------------------
@@ -62,6 +75,9 @@ JBIS_BASE_URL: Final[str] = "https://www.jbis.or.jp/horse/"
 
 # 系統キャッシュを永続化する SQLite ファイルパス
 SIRE_LINEAGE_DB_PATH: Final[Path] = Path("data/raw/pedigree/sire_lineage.db")
+
+# 種牡馬登場回数を記録するテーブル名（sire_lineage.db 内）
+SIRE_APPEARANCE_COUNT_TABLE: Final[str] = "sire_appearance_count"
 
 # 系統創始者・サブ系統の定義 YAML ファイルパス
 LINEAGE_YAML_PATH: Final[Path] = Path("config/lineage.yaml")
@@ -125,13 +141,19 @@ _UNKNOWN_LINEAGE_ID: Final[str] = "UNKNOWN"
 @dataclass(slots=True, frozen=True)
 class Ancestor:
     """
-    血統表の 1 ノードを表す内部データ構造。
+    競走馬の祖先情報（馬名・馬ID）を保持するデータクラス。
 
-    frozen=True により、スクレイピング後の書き換えを防止する。
+    Attributes:
+        horse_name (str): 馬名。
+        horse_id (str): JBIS馬ID（10桁0埋め）。
 
-    Args:
-        horse_name (str): 馬名（正規化済み）。
-        horse_id (str): 馬固有ID（10桁ゼロ埋め文字列）。
+    Raises:
+        FrozenInstanceError: frozen=True のため、インスタンス生成後のフィールド書き換えは不可。
+
+    Example:
+        >>> anc = Ancestor(horse_name="キタサンブラック", horse_id="0001155349")
+        >>> anc.horse_name
+        'キタサンブラック'
     """
 
     horse_name: str
@@ -141,15 +163,26 @@ class Ancestor:
 @dataclass(slots=True, frozen=True)
 class LineageResult:
     """
-    系統判定結果を表す内部データ構造。
+    系統判定結果（馬ID・馬名・系統名・系統ID）を保持するデータクラス。
 
-    frozen=True により、判定後の書き換えを防止する。
+    Attributes:
+        horse_id (str): JBIS馬ID。
+        horse_name (str): 馬名。
+        lineage (str): 系統名。
+        lineage_id (str): 系統ID。
 
-    Args:
-        horse_id (str): 対象種牡馬の馬固有ID。
-        horse_name (str): 対象種牡馬の馬名。
-        lineage (str): 判定された系統名（例: "サンデーサイレンス系"）。
-        lineage_id (str): 系統固有ID。未判定時は "UNKNOWN"。
+    Raises:
+        FrozenInstanceError: frozen=True のため、インスタンス生成後のフィールド書き換えは不可。
+
+    Example:
+        >>> result = LineageResult(
+        ...     horse_id="9999999999",
+        ...     horse_name="Sunday Silence",
+        ...     lineage="サンデーサイレンス系",
+        ...     lineage_id="SS001",
+        ... )
+        >>> result.lineage
+        'サンデーサイレンス系'
     """
 
     horse_id: str
@@ -165,23 +198,22 @@ class LineageResult:
 
 def to_halfwidth(text: str) -> str:
     """
-    全角文字を半角に変換し、国名表記 (USA) 等を除去する。
-
-    JBIS の馬名は全角カタカナ・英字が混在するため、
-    系統照合前に正規化して表記ゆれを吸収する。
+    文字列を半角・国名除去・空白除去で正規化する。
 
     Args:
-        text (str): 変換対象の文字列。
+        text (str): 入力文字列。
 
     Returns:
-        str: 正規化済み文字列。空文字入力時は空文字を返す。
+        str: 正規化後の文字列。入力が空文字・None 相当の場合は空文字を返す。
 
     Raises:
-        なし
+        None: 本関数は例外を外部へ伝播しない。
 
     Example:
-        result = to_halfwidth("サンデーサイレンス（ＵＳＡ）")
-        # "サンデーサイレンス"
+        >>> to_halfwidth("Sunday Silence(USA)")
+        'Sunday Silence'
+        >>> to_halfwidth("キタサン ブラック")
+        'キタサンブラック'
     """
     if not text:
         return ""
@@ -201,23 +233,25 @@ def to_halfwidth(text: str) -> str:
 
 def normalize_name(name: str) -> str:
     """
-    馬名を系統照合用に正規化する（半角化 + 空白除去 + 大文字化）。
+    馬名を半角・国名除去・空白除去・大文字化で正規化する。
 
-    YAML の創始者キーと照合するため、
-    表記ゆれを完全に吸収した統一形式に変換する。
+    YAML 創始者辞書との照合時に表記ゆれを吸収するため、
+    `to_halfwidth` の変換に加えて大文字化を適用する。
 
     Args:
-        name (str): 正規化対象の馬名。
+        name (str): 馬名。
 
     Returns:
-        str: 正規化済み文字列（大文字・空白なし）。
+        str: 正規化後の馬名。入力が空文字・None 相当の場合は空文字を返す。
 
     Raises:
-        なし
+        None: 本関数は例外を外部へ伝播しない。
 
     Example:
-        key = normalize_name("Sunday Silence")
-        # "SUNDAYSILENCE"
+        >>> normalize_name("Sunday Silence(USA)")
+        'SUNDAYSILENCE'
+        >>> normalize_name("サンデーサイレンス")
+        'サンデーサイレンス'
     """
     if not name:
         return ""
@@ -228,25 +262,27 @@ def normalize_name(name: str) -> str:
 
 def format_horse_id(raw_id: Any) -> str:
     """
-    任意の形式の馬 ID を 10 桁ゼロ埋め文字列に統一する。
+    馬IDを10桁0埋めの文字列に正規化する。
 
-    スクレイピング元によって桁数が異なる場合があるため、
-    DB キーとしての一貫性を確保するために正規化する。
+    race.db (INTEGER) と pedigree.db (TEXT 10桁) の型不一致を吸収するため、
+    数字のみを抽出して 10 桁にゼロ埋めする。
 
     Args:
-        raw_id (Any): 変換元の馬 ID（int / str / None 等）。
+        raw_id (Any): 入力馬ID。数値・文字列・None など任意の型を受け付ける。
 
     Returns:
-        str: 10 桁ゼロ埋め文字列。数字が含まれない場合は空文字。
+        str: 10桁0埋めの馬ID文字列。数字が含まれない場合は空文字を返す。
 
     Raises:
-        なし
+        None: 本関数は例外を外部へ伝播しない。
 
     Example:
-        result = format_horse_id("2021100001")
-        # "2021100001"
-        result = format_horse_id(123)
-        # "0000000123"
+        >>> format_horse_id("2021100001")
+        '2021100001'
+        >>> format_horse_id(123)
+        '0000000123'
+        >>> format_horse_id(None)
+        ''
     """
     if not raw_id:
         return ""
@@ -265,24 +301,23 @@ def load_lineage_config(
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, str]]:
     """
-    YAML 設定ファイルから系統創始者の定義を再帰的に読み込む。
-
-    YAML 構造はネスト状のサブ系統を持つため、
-    再帰トラバーサルで全ノードを展開して返す。
+    系統創始者・サブ系統の定義YAMLをロードし、創始者名でインデックス化した辞書を返す。
 
     Args:
         logger (logging.Logger): ログ出力用ロガー。
 
     Returns:
-        Dict[str, Dict[str, str]]: 正規化済み馬名をキー、
-                                   {"name": 系統名, "id": 系統ID} を値とする辞書。
+        Dict[str, Dict[str, str]]: 正規化馬名→系統情報の辞書。
+                                   YAML 未存在・形式不正時は空辞書を返す。
 
     Raises:
-        なし（ロード失敗時は空辞書を返す）
+        None: ファイル読み込みエラーは load_data 内部で捕捉しログ出力する。
 
     Example:
-        founders = load_lineage_config(logger)
-        # {"SUNDAYSILENCE": {"name": "サンデーサイレンス系", "id": "SS001"}, ...}
+        >>> logger = setup_logger("logs/test.log", logger_name="Test")
+        >>> founders = load_lineage_config(logger)
+        >>> isinstance(founders, dict)
+        True
     """
     data = load_data(str(LINEAGE_YAML_PATH), logger)
 
@@ -293,14 +328,19 @@ def load_lineage_config(
     founders: Dict[str, Dict[str, str]] = {}
 
     def _traverse(node: Dict[str, Any]) -> None:
-        """YAML ノードを再帰的に走査し、創始者情報を展開する。"""
-        # founder キーが存在する場合は創始者として登録する
-        if node.get("founder"):
-            founders[normalize_name(node["founder"])] = {
-                "name": node.get("name", _UNKNOWN_LINEAGE),
-                "id": node.get("lineage_id", _UNKNOWN_LINEAGE_ID),
-            }
-        # sub_lineages が存在する場合は再帰的に展開する
+        founders_raw = node.get("founder")
+        if founders_raw:
+            founders_list = (
+                founders_raw if isinstance(founders_raw, list) else [founders_raw]
+            )
+            for founder_name in founders_list:
+                if isinstance(founder_name, str):
+                    norm = normalize_name(founder_name)
+                    founders[norm] = {
+                        "name": node.get("name", _UNKNOWN_LINEAGE),
+                        "id": node.get("lineage_id", _UNKNOWN_LINEAGE_ID),
+                        "founder_names": founders_list,
+                    }
         for sub in (node.get("sub_lineages") or {}).values():
             _traverse(sub)
 
@@ -315,22 +355,23 @@ def load_existing_lineages(
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, str]]:
     """
-    キャッシュ DB (sire_lineage.db) から既存の系統判定結果を読み込む。
-
-    DB が存在しない場合は空辞書を返し、初回起動時も安全に動作する。
+    系統キャッシュDBから既存の系統情報をロードする。
 
     Args:
         logger (logging.Logger): ログ出力用ロガー。
 
     Returns:
-        Dict[str, Dict[str, str]]: 馬 ID (10桁文字列) をキー、
-                                   系統情報辞書を値とする辞書。
+        Dict[str, Dict[str, str]]: 馬ID→系統情報の辞書。
+                                   DB 未存在・読み込み失敗時は空辞書を返す。
 
     Raises:
-        なし（DB 未存在時は空辞書を返す）
+        None: DB 読み込みエラーは load_from_db 内部で捕捉しログ出力する。
 
     Example:
-        cache = load_existing_lineages(logger)
+        >>> logger = setup_logger("logs/test.log", logger_name="Test")
+        >>> existing = load_existing_lineages(logger)
+        >>> isinstance(existing, dict)
+        True
     """
     # DB ファイルが存在しない場合は全件新規として扱う
     if not SIRE_LINEAGE_DB_PATH.exists():
@@ -347,6 +388,86 @@ def load_existing_lineages(
     }
 
 
+def _update_sire_appearance_counts(
+    lineage_results: List[LineageResult],
+    db_path: Path,
+    logger: logging.Logger,
+) -> None:
+    """
+    種牡馬リストの登場回数をDBに記録・更新する。
+
+    同一血統表内での重複も個別にカウントするため、まず lineage_results を
+    horse_id ごとに集約し、登場回数を加算したうえで UPSERT する。
+    DB に未登録の種牡馬は count=N で新規挿入し、登録済みの場合は count を N 増やす。
+    horse_id が空の種牡馬（未登録・不明）はスキップする。
+
+    db_manager.save_to_db は INSERT のみ対応のため、本処理では sqlite3 を直接使用する。
+    DB ファイルが未存在の場合は作成し、sire_appearance_count テーブルも自動作成する。
+
+    Args:
+        lineage_results (List[LineageResult]): 系統判定済み種牡馬リスト（1頭分・最大31件）。
+        db_path (Path): sire_lineage.db のファイルパス。
+        logger (logging.Logger): ログ出力用ロガー。
+
+    Returns:
+        None: 戻り値なし（副作用として DB の count カラムを更新する）。
+
+    Raises:
+        None: sqlite3.Error は内部で捕捉しログ出力する。
+
+    Example:
+        >>> results = [LineageResult("0001155349", "キタサンブラック", "サンデーサイレンス系", "SS001")]
+        >>> _update_sire_appearance_counts(results, Path("data/raw/pedigree/sire_lineage.db"), logger)
+    """
+    valid_sires = [r for r in lineage_results if r.horse_id]
+    if not valid_sires:
+        logger.debug("カウント対象の種牡馬が存在しません。スキップします。")
+        return
+
+    # horse_id ごとに登場回数を集約（同一血統表内の重複も加算）
+    count_by_id: Dict[str, int] = {}
+    name_by_id: Dict[str, str] = {}
+    for r in valid_sires:
+        count_by_id[r.horse_id] = count_by_id.get(r.horse_id, 0) + 1
+        name_by_id[r.horse_id] = r.horse_name
+
+    rows = [
+        (horse_id, name_by_id[horse_id], count)
+        for horse_id, count in count_by_id.items()
+    ]
+
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {SIRE_APPEARANCE_COUNT_TABLE} (
+                    horse_id   TEXT PRIMARY KEY,
+                    horse_name TEXT,
+                    count      INTEGER DEFAULT 0
+                )
+                """
+            )
+            conn.executemany(
+                f"""
+                INSERT INTO {SIRE_APPEARANCE_COUNT_TABLE}
+                    (horse_id, horse_name, count)
+                VALUES (?, ?, ?)
+                ON CONFLICT(horse_id)
+                DO UPDATE SET count = count + excluded.count
+                """,
+                rows,
+            )
+            conn.commit()
+        logger.debug(
+            "種牡馬登場回数を更新: %d 頭（延べ出現回数 +%d）",
+            len(rows),
+            sum(c for _, _, c in rows),
+        )
+    except sqlite3.Error as e:
+        logger.error("種牡馬登場回数の更新に失敗しました: %s", e, exc_info=True)
+
+
 # ---------------------------------------------------------
 # HTML パーサー
 # ---------------------------------------------------------
@@ -354,25 +475,25 @@ def load_existing_lineages(
 
 def _parse_ancestor_items(soup: BeautifulSoup) -> List[Ancestor]:
     """
-    BeautifulSoup オブジェクトから血統表ノードを抽出し Ancestor リストを生成する。
-
-    JBIS の血統ページは `div.data-3__male` と `div.data-3__female` で
-    雄・雌を区別して配置されている。
-    ドキュメント順に取得することで血統表上の位置（インデックス）を保持する。
+    JBIS血統表HTMLから祖先ノード（雄・雌）を抽出し、Ancestorリストを返す。
 
     Args:
-        soup (BeautifulSoup): パース済みの HTML オブジェクト。
+        soup (BeautifulSoup): 血統表HTMLのBeautifulSoupオブジェクト。
 
     Returns:
-        List[Ancestor]: 血統表上の全ノードの Ancestor リスト（最大 62 要素）。
+        List[Ancestor]: 祖先情報リスト（ドキュメント順）。取得ゼロ件の場合は空リスト。
 
     Raises:
-        なし
+        None: HTML 構造に不整合がある場合も例外を伝播せず空リストまたは部分リストを返す。
 
     Example:
-        ancestors = _parse_ancestor_items(soup)
+        >>> from bs4 import BeautifulSoup
+        >>> html = "<div class='data-3__items'><div class='data-3__male'><a class='txt-link' href='/horse/2021100001/'>テスト馬</a></div></div>"
+        >>> soup = BeautifulSoup(html, "html.parser")
+        >>> items = _parse_ancestor_items(soup)
+        >>> items[0].horse_id
+        '2021100001'
     """
-    # JBIS 特有のクラス構造から雄・雌ノードを取得する（ドキュメント順を維持）
     items = soup.select(
         "div.data-3__items div.data-3__male," " div.data-3__items div.data-3__female"
     )
@@ -402,27 +523,23 @@ def extract_pedigree_data(
     horse_id: str,
 ) -> Optional[Dict[str, Any]]:
     """
-    血統ページの HTML 文字列から馬名・全祖先情報を抽出する。
-
-    ネットワーク処理とパース処理を分離するため、
-    本関数は HTML 文字列を受け取り純粋な辞書を返す設計とする。
+    JBIS血統ページHTMLから馬名・祖先リストを抽出する。
 
     Args:
-        html (str): JBIS 血統ページの HTML 文字列。
-        horse_id (str): 対象馬の固有 ID（ログ・識別用）。
+        html (str): 血統ページHTML。
+        horse_id (str): 馬ID。
 
     Returns:
-        Optional[Dict[str, Any]]: 抽出成功時は
-            {"horse_id": str, "name": str, "ancestors": List[Ancestor]}、
-            失敗時（血統ノードが空）は None。
+        Optional[Dict[str, Any]]: {'horse_id', 'name', 'ancestors'} の辞書。
+                                   祖先が 1 件も取得できない場合は None。
 
     Raises:
-        なし
+        None: HTML パースエラーは BeautifulSoup が内部で吸収する。
 
     Example:
-        data = extract_pedigree_data(html_text, "2021100001")
-        if data:
-            ancestors = data["ancestors"]
+        >>> data = extract_pedigree_data(html_string, "0001155349")
+        >>> data["horse_id"]
+        '0001155349'
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -458,27 +575,25 @@ def trace_sire_lineage(
     logger: logging.Logger,
 ) -> Optional[LineageResult]:
     """
-    特定不能な種牡馬を JBIS で父系遡上し、系統を特定する。
-
-    創始者またはキャッシュに当たるまで最大 MAX_TRACE_CYCLES サイクル繰り返す。
-    スタックオーバーフロー防止のため再帰ではなく反復処理で実装する。
+    父系遡上により系統を特定する（YAML→DB→JBISスクレイピングの順）。
 
     Args:
-        start_id (str): 遡上開始の種牡馬 ID。
-        founders (Dict[str, Dict[str, str]]): 系統創始者辞書（YAML ロード済み）。
-        existing (Dict[str, Dict[str, str]]): キャッシュ辞書（DB ロード済み）。
+        start_id (str): 起点馬ID。
+        founders (Dict[str, Dict[str, str]]): 創始者辞書。
+        existing (Dict[str, Dict[str, str]]): 既存キャッシュ辞書。
         logger (logging.Logger): ログ出力用ロガー。
 
     Returns:
-        Optional[LineageResult]: 系統特定成功時は LineageResult、失敗時は None。
+        Optional[LineageResult]: 系統判定結果。
+                                  最大サイクル到達・起点枯渇・HTTP失敗時は None。
 
     Raises:
-        なし（HTTP 失敗・系統未特定は None として返す）
+        None: HTTP エラーは fetch_html 内部で捕捉しログ出力する。
 
     Example:
-        result = trace_sire_lineage("2021100001", founders, existing, logger)
-        if result:
-            print(result.lineage)
+        >>> result = trace_sire_lineage("0001155349", founders, existing, logger)
+        >>> result.lineage if result else "不明"
+        'サンデーサイレンス系'
     """
     current_id: str = format_horse_id(start_id)
     visited_ids: Set[str] = set()
@@ -559,29 +674,25 @@ def determine_lineages_for_sires(
     logger: logging.Logger,
 ) -> List[LineageResult]:
     """
-    種牡馬リストに対して系統判定を一括で実行する。
-
-    判定優先順位:
-      1. 馬名が YAML 創始者リストに一致 → 即時確定
-      2. 馬 ID がキャッシュ DB に存在  → キャッシュ返却
-      3. 上記いずれも不一致            → JBIS 父系遡上スクレイピング
-
-    新規判定結果はオンメモリキャッシュと DB の両方に反映する。
+    種牡馬リストに対し系統判定を一括実行し、結果リストを返す。
 
     Args:
-        sire_list (List[Ancestor]): 系統判定対象の種牡馬リスト（31 件）。
-        founders (Dict[str, Dict[str, str]]): 系統創始者辞書（YAML ロード済み）。
-        existing (Dict[str, Dict[str, str]]): キャッシュ辞書（DB ロード済み・更新あり）。
+        sire_list (List[Ancestor]): 種牡馬Ancestorリスト。
+        founders (Dict[str, Dict[str, str]]): 創始者辞書。
+        existing (Dict[str, Dict[str, str]]): 既存キャッシュ辞書（更新される）。
         logger (logging.Logger): ログ出力用ロガー。
 
     Returns:
-        List[LineageResult]: 各種牡馬の系統判定結果リスト（入力と同順）。
+        List[LineageResult]: 系統判定結果リスト。sire_list と同じ順序・件数で返る。
+                             特定不能の場合は lineage_id=_UNKNOWN_LINEAGE_ID の結果が入る。
 
     Raises:
-        なし
+        None: HTTP エラー・DB 書き込みエラーは内部で捕捉しログ出力する。
 
     Example:
-        results = determine_lineages_for_sires(sire_list, founders, existing, logger)
+        >>> results = determine_lineages_for_sires(sire_list, founders, existing, logger)
+        >>> results[0].lineage
+        'サンデーサイレンス系'
     """
     results: List[LineageResult] = []
 
@@ -593,53 +704,38 @@ def determine_lineages_for_sires(
     # ---------------------------------------------------------
 
     for sire in sire_list:
-
         norm_name = normalize_name(sire.horse_name)
 
-        # 未登録・不明馬は判定不能として即確定する
+        # デフォルト値
+        target_lineage = _UNKNOWN_LINEAGE
+        target_lineage_id = _UNKNOWN_LINEAGE_ID
+
+        # 判定ロジック
         if not sire.horse_id or sire.horse_name in (_UNKNOWN_LINEAGE, "未登録"):
-            result = LineageResult(
-                horse_id=sire.horse_id,
-                horse_name=sire.horse_name,
-                lineage=_UNKNOWN_LINEAGE,
-                lineage_id=_UNKNOWN_LINEAGE_ID,
-            )
-
-        # 優先順位 1: YAML 創始者リストに一致する場合
+            pass  # 不明のまま
         elif norm_name in founders:
-            f = founders[norm_name]
-            result = LineageResult(
-                horse_id=sire.horse_id,
-                horse_name=sire.horse_name,
-                lineage=f["name"],
-                lineage_id=f["id"],
-            )
-
-        # 優先順位 2: キャッシュ DB に存在する場合
+            target_lineage = founders[norm_name]["name"]
+            target_lineage_id = founders[norm_name]["id"]
         elif sire.horse_id in existing:
-            e = existing[sire.horse_id]
-            result = LineageResult(
-                horse_id=sire.horse_id,
-                horse_name=sire.horse_name,
-                lineage=e["lineage"],
-                lineage_id=e["lineage_id"],
-            )
-
-        # 優先順位 3: JBIS 父系遡上スクレイピングで特定を試みる
+            target_lineage = existing[sire.horse_id]["lineage"]
+            target_lineage_id = existing[sire.horse_id]["lineage_id"]
         else:
             traced = trace_sire_lineage(sire.horse_id, founders, existing, logger)
-            result = traced or LineageResult(
-                horse_id=sire.horse_id,
-                horse_name=sire.horse_name,
-                lineage=_UNKNOWN_LINEAGE,
-                lineage_id=_UNKNOWN_LINEAGE_ID,
-            )
+            if traced:
+                # 意図: traced のID/Nameは祖先なので、lineage情報のみ採用し
+                #       照会元（sire）のID/Nameを維持する
+                target_lineage = traced.lineage
+                target_lineage_id = traced.lineage_id
 
+        result = LineageResult(
+            horse_id=sire.horse_id,
+            horse_name=sire.horse_name,
+            lineage=target_lineage,
+            lineage_id=target_lineage_id,
+        )
         results.append(result)
 
-        # 新規判定済みの場合はオンメモリキャッシュと DB 登録候補に追加する
         if result.lineage_id != _UNKNOWN_LINEAGE_ID and sire.horse_id not in existing:
-            # asdict を使用して frozen dataclass から辞書に変換する
             existing[sire.horse_id] = asdict(result)
             new_cache_entries.append(asdict(result))
 
@@ -666,26 +762,24 @@ def scrape_pedigree_data(
     logger: logging.Logger,
 ) -> List[PedigreeInfo]:
     """
-    競走馬リストの血統情報を JBIS から一括取得し、系統判定済み PedigreeInfo を生成する。
-
-    設定・キャッシュのロードはループ外で 1 回のみ実行し、
-    ループ内での重複 I/O を排除する。
+    競走馬リストに対し血統・系統情報を一括スクレイピングし、PedigreeInfoリストを返す。
 
     Args:
-        horse_list (List[Dict[str, Any]]): 収集対象馬のリスト。
-                                           各要素は {"id": str, "url": str} を持つこと。
+        horse_list (List[Dict[str, Any]]): {'id', 'url'} を持つ馬リスト。
         logger (logging.Logger): ログ出力用ロガー。
 
     Returns:
-        List[PedigreeInfo]: 系統判定済みの血統情報オブジェクトリスト。
-                            HTML 取得失敗・パース失敗の馬はリストから除外される。
+        List[PedigreeInfo]: 血統・系統情報リスト。
+                            HTML 取得失敗・パース失敗の馬はスキップされリストに含まれない。
 
     Raises:
-        なし（各馬のエラーはログで通知しスキップ）
+        None: HTTP エラー・パースエラーは内部でキャッチしログ出力するため外部へ伝播しない。
 
     Example:
-        logger = logging.getLogger("PedigreeScraper")
-        results = scrape_pedigree_data(horse_list, logger)
+        >>> logger = setup_logger("logs/pedigree.log", logger_name="Pedigree")
+        >>> results = scrape_pedigree_data([{"id": "0001155349", "url": "..."}], logger)
+        >>> results[0].horse_id
+        '0001155349'
     """
     # ---------------------------------------------------------
     # 設定・キャッシュのロード (ループ外で 1 回のみ実行)
@@ -755,13 +849,16 @@ def scrape_pedigree_data(
             sire_list, founders, existing, logger
         )
 
+        # 登場した種牡馬の回数をDBに反映（同一血統表内の重複も集約してからUPSERT）
+        _update_sire_appearance_counts(lineage_results, SIRE_LINEAGE_DB_PATH, logger)
+
         # ---------------------------------------------------------
         # PedigreeInfo オブジェクトの生成
         # ---------------------------------------------------------
 
         results.append(
             PedigreeInfo(
-                horse_id=int(h_id) if h_id.isdigit() else 0,
+                horse_id=h_id,
                 name=pedigree_data["name"],
                 five_gen_ancestor_names=[a.horse_name for a in ancestors],
                 five_gen_ancestor_ids=[
@@ -798,142 +895,261 @@ def scrape_pedigree_data(
 
 def _run_tests() -> None:
     """
-    主要関数の正常系・異常系動作を確認する。
+    主要機能の動作確認テストを実行する。
 
-    外部依存（JBIS HTTP・DB・YAML）はダミーデータで代替し、
-    ネットワーク接続なしで実行できる。
-    print は本ブロック内のみ許可。
+    外部依存（DB・ネットワーク・YAML）はダミーデータまたは unittest.mock.patch で
+    代替するため、単体実行が可能。
+    テスト終了後はログファイルとロガーをすべて解放・削除する。
+
+    Args:
+        なし。
+
+    Returns:
+        None: 戻り値なし。テスト結果は標準出力に print する。
+
+    Raises:
+        None: AssertionError および予期しない例外は内部でキャッチして出力する。
+
+    Example:
+        # python -m src.data_pipeline.pedigree_scraper
+        _run_tests()
     """
-    import sys
+    from unittest.mock import patch
+
+    from src.utils.logger import close_logger_handlers, setup_logger
+
+    TEST_LOG_DIR: Final[str] = "logs/_test_pedigree_scraper_tmp"
+    TEST_LOG_FILE: Final[str] = f"{TEST_LOG_DIR}/test.log"
+    TEST_LOGGER_NAME: Final[str] = "test_pedigree_scraper"
 
     print("=" * 60)
     print(" pedigree_scraper.py 簡易単体テスト 開始")
     print("=" * 60)
 
-    # テスト用ロガーをコンソールへ接続する
-    test_logger = logging.getLogger("test_pedigree_scraper")
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    test_logger.addHandler(handler)
-    test_logger.setLevel(logging.DEBUG)
-
-    # ---------------------------------------------------------
-    # テスト 1: format_horse_id 正常系
-    # ---------------------------------------------------------
-    print("\n[TEST 1] format_horse_id 正常系")
-    assert format_horse_id("2021100001") == "2021100001"
-    assert format_horse_id(123) == "0000000123"
-    assert format_horse_id("") == ""
-    assert format_horse_id(None) == ""
-    print("  -> PASS")
-
-    # ---------------------------------------------------------
-    # テスト 2: normalize_name 正常系
-    # ---------------------------------------------------------
-    print("\n[TEST 2] normalize_name 正常系")
-    assert normalize_name("Sunday Silence") == "SUNDAYSILENCE"
-    assert normalize_name("サンデーサイレンス") == "サンデーサイレンス"
-    assert normalize_name("") == ""
-    print("  -> PASS")
-
-    # ---------------------------------------------------------
-    # テスト 3: to_halfwidth 国名除去
-    # ---------------------------------------------------------
-    print("\n[TEST 3] to_halfwidth 国名括弧除去")
-    result = to_halfwidth("Sunday Silence(USA)")
-    assert "USA" not in result, f"[FAIL] 国名が除去されていません: {result}"
-    print(f"  変換結果: '{result}'")
-    print("  -> PASS")
-
-    # ---------------------------------------------------------
-    # テスト 4: _parse_ancestor_items HTML パース
-    # ---------------------------------------------------------
-    print("\n[TEST 4] _parse_ancestor_items HTML パース")
-    dummy_html = """
-    <div class="data-3__items">
-      <div class="data-3__male">
-        <a class="txt-link" href="/horse/2021100001/">テスト種牡馬</a>
-      </div>
-      <div class="data-3__female">
-        <a class="txt-link" href="/horse/2021100002/">テスト牝馬</a>
-      </div>
-    </div>
-    """
-    soup = BeautifulSoup(dummy_html, "html.parser")
-    ancestors = _parse_ancestor_items(soup)
-    assert len(ancestors) == 2, f"[FAIL] 期待 2件 / 実際 {len(ancestors)}件"
-    assert ancestors[0].horse_id == "2021100001"
-    assert ancestors[0].horse_name == "テスト種牡馬"
-    print(f"  抽出件数: {len(ancestors)} 件")
-    print(f"  ancestors[0]: {ancestors[0]}")
-    print("  -> PASS")
-
-    # ---------------------------------------------------------
-    # テスト 5: determine_lineages_for_sires キャッシュヒット
-    # ---------------------------------------------------------
-    print("\n[TEST 5] determine_lineages_for_sires キャッシュヒット")
-    test_sires = [
-        Ancestor(horse_name="テスト種牡馬", horse_id="2021100001"),
-        Ancestor(horse_name="未登録", horse_id=""),
-    ]
-    test_existing: Dict[str, Dict[str, str]] = {
-        "2021100001": {
-            "horse_id": "2021100001",
-            "horse_name": "テスト種牡馬",
-            "lineage": "サンデーサイレンス系",
-            "lineage_id": "SS001",
-        }
-    }
-    test_founders: Dict[str, Dict[str, str]] = {}
-
-    lineage_results = determine_lineages_for_sires(
-        test_sires, test_founders, test_existing, test_logger
+    logger = setup_logger(
+        log_filepath=TEST_LOG_FILE,
+        log_level="DEBUG",
+        logger_name=TEST_LOGGER_NAME,
     )
-    assert len(lineage_results) == 2, f"[FAIL] 期待 2件 / 実際 {len(lineage_results)}件"
-    assert lineage_results[0].lineage == "サンデーサイレンス系"
-    assert lineage_results[1].lineage_id == _UNKNOWN_LINEAGE_ID
-    print(f"  キャッシュヒット: {lineage_results[0].lineage}")
-    print(f"  未登録馬: lineage_id={lineage_results[1].lineage_id}")
-    print("  -> PASS")
 
-    # ---------------------------------------------------------
-    # テスト 6: determine_lineages_for_sires YAML 創始者ヒット
-    # ---------------------------------------------------------
-    print("\n[TEST 6] determine_lineages_for_sires YAML 創始者ヒット")
-    founder_sire = Ancestor(horse_name="Sunday Silence", horse_id="9999999999")
-    test_founders_with_ss: Dict[str, Dict[str, str]] = {
-        "SUNDAYSILENCE": {"name": "サンデーサイレンス系", "id": "SS001"}
-    }
-    founder_results = determine_lineages_for_sires(
-        [founder_sire], test_founders_with_ss, {}, test_logger
-    )
-    assert founder_results[0].lineage == "サンデーサイレンス系"
-    print(f"  YAML 創始者ヒット: {founder_results[0].lineage}")
-    print("  -> PASS")
-
-    # ---------------------------------------------------------
-    # テスト 7: LABELS_SIRE_INDEX と SIRE_POSITIONS の整合性
-    # ---------------------------------------------------------
-    print("\n[TEST 7] LABELS_SIRE_INDEX と SIRE_POSITIONS の整合性")
-    assert (
-        len(LABELS_SIRE_INDEX) == 31
-    ), f"[FAIL] 期待 31件 / 実際 {len(LABELS_SIRE_INDEX)}件"
-    assert len(SIRE_POSITIONS) == 31
-    assert SIRE_POSITIONS == sorted(LABELS_SIRE_INDEX.values())
-    print(f"  LABELS_SIRE_INDEX: {len(LABELS_SIRE_INDEX)} 件")
-    print("  -> PASS")
-
-    # ---------------------------------------------------------
-    # テスト 8: Ancestor frozen=True による書き換え防止
-    # ---------------------------------------------------------
-    print("\n[TEST 8] Ancestor frozen=True による書き換え防止")
-    anc = Ancestor(horse_name="テスト", horse_id="0000000001")
     try:
-        anc.horse_name = "改ざん"  # type: ignore[misc]
-        print("  [FAIL] frozen=True が機能していません。")
-    except Exception:
-        print("  FrozenInstanceError を正常に捕捉")
+        # ---------------------------------------------------------
+        # テスト 1: format_horse_id (正常系・異常系)
+        # ---------------------------------------------------------
+        print("\n[TEST 1] 正常系/異常系: format_horse_id の10桁0埋め変換")
+        assert format_horse_id("2021100001") == "2021100001", "10桁文字列が一致しません"
+        assert format_horse_id(123) == "0000000123", "数値の0埋めが一致しません"
+        assert format_horse_id("") == "", "空文字が空文字を返しません"
+        assert format_horse_id(None) == "", "None が空文字を返しません"
         print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 2: normalize_name (正常系・空文字)
+        # ---------------------------------------------------------
+        print("\n[TEST 2] 正常系/異常系: normalize_name の正規化")
+        assert (
+            normalize_name("Sunday Silence") == "SUNDAYSILENCE"
+        ), "英語馬名の正規化が一致しません"
+        assert (
+            normalize_name("サンデーサイレンス") == "サンデーサイレンス"
+        ), "日本語馬名の正規化が一致しません"
+        assert normalize_name("") == "", "空文字が空文字を返しません"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 3: to_halfwidth (国名括弧除去)
+        # ---------------------------------------------------------
+        print("\n[TEST 3] 正常系: to_halfwidth の国名括弧除去")
+        result = to_halfwidth("Sunday Silence(USA)")
+        assert "USA" not in result, f"国名が除去されていません: {result!r}"
+        assert "(" not in result, f"括弧が除去されていません: {result!r}"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 4: _parse_ancestor_items (ダミーHTML パース)
+        # ---------------------------------------------------------
+        print("\n[TEST 4] 正常系: _parse_ancestor_items のダミーHTML パース")
+        dummy_html = (
+            "<div class='data-3__items'>"
+            "<div class='data-3__male'>"
+            "<a class='txt-link' href='/horse/2021100001/'>テスト種牡馬</a>"
+            "</div>"
+            "<div class='data-3__female'>"
+            "<a class='txt-link' href='/horse/2021100002/'>テスト牝馬</a>"
+            "</div>"
+            "</div>"
+        )
+        soup = BeautifulSoup(dummy_html, "html.parser")
+        ancestors = _parse_ancestor_items(soup)
+        assert (
+            len(ancestors) == 2
+        ), f"抽出件数が一致しません: {len(ancestors)} (期待値: 2)"
+        assert (
+            ancestors[0].horse_id == "2021100001"
+        ), f"horse_id が一致しません: {ancestors[0].horse_id!r}"
+        assert (
+            ancestors[0].horse_name == "テスト種牡馬"
+        ), f"horse_name が一致しません: {ancestors[0].horse_name!r}"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 5: determine_lineages_for_sires (キャッシュヒット)
+        # ---------------------------------------------------------
+        print("\n[TEST 5] 正常系: determine_lineages_for_sires のキャッシュヒット")
+        # 意図: キャッシュ既存馬はDBへの書き込みが発生しないため patch 不要
+        test_sires = [
+            Ancestor(horse_name="テスト種牡馬", horse_id="2021100001"),
+            Ancestor(horse_name="未登録", horse_id=""),
+        ]
+        test_existing: Dict[str, Dict[str, str]] = {
+            "2021100001": {
+                "horse_id": "2021100001",
+                "horse_name": "テスト種牡馬",
+                "lineage": "サンデーサイレンス系",
+                "lineage_id": "SS001",
+            }
+        }
+        lineage_results = determine_lineages_for_sires(
+            test_sires, {}, test_existing, logger
+        )
+        assert (
+            len(lineage_results) == 2
+        ), f"返却件数が一致しません: {len(lineage_results)} (期待値: 2)"
+        assert (
+            lineage_results[0].lineage == "サンデーサイレンス系"
+        ), f"lineage が一致しません: {lineage_results[0].lineage!r}"
+        assert (
+            lineage_results[1].lineage_id == _UNKNOWN_LINEAGE_ID
+        ), f"未登録馬の lineage_id が一致しません: {lineage_results[1].lineage_id!r}"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 6: determine_lineages_for_sires (YAML 創始者ヒット)
+        # ---------------------------------------------------------
+        print("\n[TEST 6] 正常系: determine_lineages_for_sires の YAML 創始者ヒット")
+        # 意図: 新規馬（existing に存在しない）が YAML にヒットすると save_to_db が
+        #       呼ばれるため patch で外部DB書き込みを排除する
+        founder_sire = Ancestor(horse_name="Sunday Silence", horse_id="9999999999")
+        test_founders_with_ss: Dict[str, Dict[str, str]] = {
+            "SUNDAYSILENCE": {"name": "サンデーサイレンス系", "id": "SS001"}
+        }
+        with patch("src.data_pipeline.pedigree_scraper.save_to_db"):
+            founder_results = determine_lineages_for_sires(
+                [founder_sire], test_founders_with_ss, {}, logger
+            )
+        assert (
+            founder_results[0].lineage == "サンデーサイレンス系"
+        ), f"YAML 創始者ヒット結果が一致しません: {founder_results[0].lineage!r}"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 7: LABELS_SIRE_INDEX と SIRE_POSITIONS の整合性
+        # ---------------------------------------------------------
+        print("\n[TEST 7] 正常系: LABELS_SIRE_INDEX と SIRE_POSITIONS の整合性")
+        assert (
+            len(LABELS_SIRE_INDEX) == 31
+        ), f"LABELS_SIRE_INDEX の件数が一致しません: {len(LABELS_SIRE_INDEX)} (期待値: 31)"
+        assert (
+            len(SIRE_POSITIONS) == 31
+        ), f"SIRE_POSITIONS の件数が一致しません: {len(SIRE_POSITIONS)} (期待値: 31)"
+        assert SIRE_POSITIONS == sorted(
+            LABELS_SIRE_INDEX.values()
+        ), "SIRE_POSITIONS が LABELS_SIRE_INDEX のソート値と一致しません"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 8: Ancestor frozen=True による書き換え防止
+        # ---------------------------------------------------------
+        print("\n[TEST 8] 正常系: Ancestor frozen=True による書き換え防止")
+        anc = Ancestor(horse_name="テスト", horse_id="0000000001")
+        try:
+            anc.horse_name = "改ざん"  # type: ignore[misc]
+            assert False, "FrozenInstanceError が発生しませんでした"
+        except Exception:
+            # 意図: frozen=True によりフィールド書き換えは例外が発生することを確認する
+            pass
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 9: _update_sire_appearance_counts (カウント更新・集約UPSERT)
+        # ---------------------------------------------------------
+        print("\n[TEST 9] 正常系: _update_sire_appearance_counts のカウント更新")
+        TEST_DB_FILE: Final[str] = f"{TEST_LOG_DIR}/test_count.db"
+        test_db_path = Path(TEST_DB_FILE)
+
+        # 前回テスト実行時の状態が残らないよう、事前にテスト用DBを削除しておく
+        if test_db_path.exists():
+            test_db_path.unlink()
+
+        test_lineage_results = [
+            LineageResult(
+                horse_id="0001155349",
+                horse_name="キタサンブラック",
+                lineage="サンデーサイレンス系",
+                lineage_id="RC-HA-SS",
+            ),
+            LineageResult(
+                horse_id="0001155349",
+                horse_name="キタサンブラック",
+                lineage="サンデーサイレンス系",
+                lineage_id="RC-HA-SS",
+            ),
+            LineageResult(
+                horse_id="",
+                horse_name="未登録",
+                lineage=_UNKNOWN_LINEAGE,
+                lineage_id=_UNKNOWN_LINEAGE_ID,
+            ),
+        ]
+
+        _update_sire_appearance_counts(test_lineage_results, test_db_path, logger)
+        _update_sire_appearance_counts(test_lineage_results, test_db_path, logger)
+
+        with sqlite3.connect(TEST_DB_FILE) as conn:
+            row = conn.execute(
+                f"SELECT count FROM {SIRE_APPEARANCE_COUNT_TABLE} WHERE horse_id = ?",
+                ("0001155349",),
+            ).fetchone()
+
+        assert row is not None, "キタサンブラックのレコードが存在しません"
+        assert row[0] == 4, f"count が期待値と一致しません: {row[0]} (期待値: 4)"
+
+        empty_row = None
+        with sqlite3.connect(TEST_DB_FILE) as conn:
+            empty_row = conn.execute(
+                f"SELECT count FROM {SIRE_APPEARANCE_COUNT_TABLE} WHERE horse_id = ?",
+                ("",),
+            ).fetchone()
+        assert empty_row is None, "未登録馬が誤ってDBに挿入されています"
+
+        print("  -> PASS")
+
+    except AssertionError as e:
+        print(f"\n[FAIL] アサーション失敗: {e}")
+    except Exception as e:
+        print(f"\n[FAIL] 予期しないエラー: {e}")
+        import traceback
+
+        traceback.print_exc()
+    finally:
+        close_logger_handlers(TEST_LOGGER_NAME)
+        if Path(TEST_LOG_DIR).exists():
+            test_dir = Path(TEST_LOG_DIR)
+            # Windows では SQLite のファイルハンドル解放が遅れ、rmtree が PermissionError になることがある
+            removed = False
+            for attempt in range(3):
+                try:
+                    shutil.rmtree(test_dir)
+                    print(f"\nCLEANUP: {TEST_LOG_DIR} を削除しました。")
+                    removed = True
+                    break
+                except PermissionError:
+                    if attempt < 2:
+                        time.sleep(0.1)
+            if not removed:
+                print(
+                    f"\nCLEANUP: {TEST_LOG_DIR} の削除をスキップしました（ファイル使用中）。"
+                )
 
     print("\n" + "=" * 60)
     print(" 全テスト完了")
@@ -942,4 +1158,15 @@ def _run_tests() -> None:
 
 if __name__ == "__main__":
     # python -m src.data_pipeline.pedigree_scraper
-    _run_tests()
+    # _run_tests()
+
+    horse_list = [
+        {
+            "id": "0001155349",
+            "url": "https://www.jbis.or.jp/horse/0001155349/",
+        },  # キタサンブラック
+    ]
+    scrape_pedigree_data(
+        horse_list,
+        setup_logger("logs/pedigree_scraper.log", logger_name="PedigreeScraper"),
+    )

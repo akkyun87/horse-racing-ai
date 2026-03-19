@@ -16,13 +16,19 @@ JBIS レース結果検索ページから、指定期間の個別レース結果
 【外部依存】
 - ネットワーク: JBIS (https://www.jbis.or.jp) への HTTP リクエスト
 - HTML 解析: BeautifulSoup4
-- HTTP リトライ処理: src.utils.retry_requests.fetch_html
+- 内部モジュール:
+    src.utils.retry_requests (fetch_html)
+    src.utils.logger         (setup_logger, close_logger_handlers)
 
 【Usage】
     from src.data_pipeline.race_list_scraper import get_race_list_urls
-    import logging
+    from src.utils.logger import setup_logger
 
-    logger = logging.getLogger(__name__)
+    logger = setup_logger(
+        log_filepath="logs/race_list_scraper.log",
+        log_level="INFO",
+        logger_name="RaceListScraper",
+    )
     urls = get_race_list_urls("2025-08-01", "2025-08-31", logger)
 """
 
@@ -32,6 +38,8 @@ JBIS レース結果検索ページから、指定期間の個別レース結果
 
 import logging
 import re
+import shutil
+from pathlib import Path
 from typing import Final, List
 from urllib.parse import urljoin
 
@@ -88,6 +96,7 @@ def get_race_list_urls(
         None: 日付パースエラーおよびネットワークエラーは内部でキャッチしログ出力する。
 
     Example:
+        >>> logger = setup_logger("logs/race_list.log", logger_name="RaceListScraper")
         >>> urls = get_race_list_urls("2025-08-01", "2025-08-31", logger)
         >>> print(urls[0])
         'https://www.jbis.or.jp/race/result/20250803/01/01/'
@@ -238,115 +247,165 @@ def get_race_list_urls(
 
 
 def _run_tests() -> None:
-    """主要機能の動作確認テストを実行する。
-
-    オフラインテスト (バリデーション・戻り値型) と
-    オンラインテスト (実ネットワーク疎通) に分離して実行する。
-    外部依存が使用できない環境ではオンラインテストを自動スキップする。
     """
-    import sys
+    主要機能の動作確認テストを実行する。
 
-    # ---- ログ設定 ----
-    test_logger = logging.getLogger("test_race_list_scraper")
-    test_logger.setLevel(logging.DEBUG)
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    test_logger.addHandler(handler)
+    fetch_html を unittest.mock.patch でモックすることで外部ネットワークへの
+    依存を排除し、単体実行を可能にする。
+    テスト終了後はログファイルとロガーをすべて解放・削除する。
 
-    print("\n" + "=" * 60)
-    print("  Unit Test: src/data_pipeline/race_list_scraper.py")
-    print("=" * 60 + "\n")
+    Args:
+        なし。
 
-    errors: List[str] = []
+    Returns:
+        None: 戻り値なし。テスト結果は標準出力に print する。
 
-    # ---------------------------------------------------------
-    # [Test 1] 異常系: 日付フォーマット不正 → 空リスト返却
-    # ---------------------------------------------------------
-    print("[Test 1] 不正な日付フォーマットの処理")
-    invalid_cases = [
-        ("20250101", "20250131"),  # ハイフンなし
-        ("2025/01/01", "2025/01/31"),  # スラッシュ区切り
-        ("", "2025-01-31"),  # 空文字
-        ("2025-13-01", "2025-13-31"),  # 存在しない月 (パースは通過するが0件になる)
-    ]
-    for s, e in invalid_cases:
-        # 完全不正形式は空リストが返ることを確認する
-        if "-" not in s or s.count("-") != 2:
-            result = get_race_list_urls(s, e, test_logger)
-            status = "OK" if result == [] else "FAIL"
-            print(f"  {status}: get_race_list_urls({s!r}, {e!r}) -> {result!r}")
-            if status == "FAIL":
-                errors.append(f"invalid date {s!r} should return [], got {result!r}")
+    Raises:
+        None: AssertionError および予期しない例外は内部でキャッチして出力する。
 
-    # ---------------------------------------------------------
-    # [Test 2] 正常系: 戻り値の型と構造
-    # ---------------------------------------------------------
-    print("\n[Test 2] 戻り値の型チェック (オフライン: モック不使用)")
-    # fetch_html が None を返す場合 (ネットワーク不可) でも
-    # 戻り値は必ず List[str] であることを確認する
-    result = get_race_list_urls("2025-08-01", "2025-08-31", test_logger)
-    status = "OK" if isinstance(result, list) else "FAIL"
-    print(f"  {status}: 戻り値が List 型であること -> {type(result).__name__}")
-    if status == "FAIL":
-        errors.append(f"return type expected list, got {type(result).__name__}")
+    Example:
+        # python -m src.data_pipeline.race_list_scraper
+        _run_tests()
+    """
+    from unittest.mock import MagicMock, patch
 
-    # 戻り値がソート済みであることを確認する
-    if result:
-        status = "OK" if result == sorted(result) else "FAIL"
-        print(f"  {status}: 戻り値が昇順ソート済みであること")
-        if status == "FAIL":
-            errors.append("return value is not sorted")
+    from src.utils.logger import close_logger_handlers, setup_logger
 
-    # ---------------------------------------------------------
-    # [Test 3] 定数の妥当性チェック
-    # ---------------------------------------------------------
-    print("\n[Test 3] 定数の妥当性")
-    const_checks = [
-        ("BASE_URL starts with https", BASE_URL.startswith("https://")),
-        ("MAX_PAGES > 0", MAX_PAGES > 0),
-        ("RACE_URL_PATTERN compiled", isinstance(RACE_URL_PATTERN, re.Pattern)),
-        (
-            "pattern matches sample",
-            bool(RACE_URL_PATTERN.match("/race/result/20250803/01/01/")),
-        ),
-        ("pattern rejects other URL", not RACE_URL_PATTERN.match("/horse/2020101234/")),
-    ]
-    for label, ok in const_checks:
-        status = "OK" if ok else "FAIL"
-        print(f"  {status}: {label}")
-        if not ok:
-            errors.append(f"constant check failed: {label}")
+    TEST_LOG_DIR: Final[str] = "logs/_test_race_list_scraper_tmp"
+    TEST_LOG_FILE: Final[str] = f"{TEST_LOG_DIR}/test.log"
+    TEST_LOGGER_NAME: Final[str] = "test_race_list_scraper"
 
-    # ---------------------------------------------------------
-    # [Test 4] オンライン疎通確認 (ネットワーク必須)
-    # ---------------------------------------------------------
-    print("\n[Test 4] 実ネットワーク疎通確認 (live network — skip if unavailable)")
+    print("=" * 60)
+    print(" race_list_scraper.py 簡易単体テスト 開始")
+    print("=" * 60)
+
+    logger = setup_logger(
+        log_filepath=TEST_LOG_FILE,
+        log_level="DEBUG",
+        logger_name=TEST_LOGGER_NAME,
+    )
+
+    def _make_mock_response(html: str) -> MagicMock:
+        """
+        指定 HTML テキストを返すモック Response を生成する。
+        `if not response:` の判定が False になるよう __bool__ は MagicMock デフォルト (True) を維持する。
+        """
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = html
+        return mock_resp
+
     try:
-        live_urls = get_race_list_urls("2025-11-01", "2025-11-03", test_logger)
-        if live_urls:
-            print(f"  OK: {len(live_urls)} 件取得")
-            print(f"  Sample: {live_urls[0]}")
-            # URL 形式の検証
-            for u in live_urls:
-                if not u.startswith(BASE_URL):
-                    errors.append(f"URL does not start with BASE_URL: {u}")
-        else:
-            print("  SKIP: 0 件 — ネットワーク未接続または対象期間に開催なし")
-    except Exception as e:
-        print(f"  SKIP: ネットワークテストをスキップ: {e}")
+        # ---------------------------------------------------------
+        # テスト 1: 異常系 (不正日付形式 → 空リスト返却)
+        # ---------------------------------------------------------
+        print("\n[TEST 1] 異常系: 不正な日付形式で空リストが返ること")
+        # 意図: ハイフン区切りでない日付はパース段階で弾かれることを検証する
+        invalid_format_cases = [
+            ("20250101", "20250131"),  # ハイフンなし
+            ("2025/01/01", "2025/01/31"),  # スラッシュ区切り
+            ("", "2025-01-31"),  # 空文字
+        ]
+        for s, e in invalid_format_cases:
+            result = get_race_list_urls(s, e, logger)
+            assert result == [], f"不正日付 {s!r} で空リスト以外が返りました: {result}"
+        print("  -> PASS")
 
-    # ---------------------------------------------------------
-    # テスト結果サマリ
-    # ---------------------------------------------------------
+        # ---------------------------------------------------------
+        # テスト 2: 異常系 (fetch_html が None → 空リスト返却)
+        # ---------------------------------------------------------
+        print("\n[TEST 2] 異常系: fetch_html=None 時に空リストが返ること")
+        # 意図: ネットワーク断等で fetch_html が None を返した場合のフォールバックを検証する
+        with patch(
+            "src.data_pipeline.race_list_scraper.fetch_html",
+            return_value=None,
+        ):
+            result = get_race_list_urls("2025-08-01", "2025-08-31", logger)
+        assert result == [], f"fetch_html=None のとき空リスト以外が返りました: {result}"
+        assert isinstance(
+            result, list
+        ), f"戻り値が List 型ではありません: {type(result)}"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 3: 正常系 (ダミーHTML → URL 抽出・重複除去・ソート検証)
+        # ---------------------------------------------------------
+        print("\n[TEST 3] 正常系: ダミー HTML からの URL 抽出・重複除去・ソート検証")
+        # 意図: 重複リンク・レース以外のリンクが正しくフィルタされることを検証する
+        dummy_html = (
+            "<html><body>"
+            '<a href="/race/result/20251103/01/02/">R2</a>'
+            '<a href="/race/result/20251101/01/01/">R1</a>'
+            # 意図: 同一URLの重複 → 最終的に1件のみカウントされるべき
+            '<a href="/race/result/20251101/01/01/">R1(重複)</a>'
+            # 意図: 馬情報ページは RACE_URL_PATTERN に一致しないため除外される
+            '<a href="/horse/2020101234/">horse(除外対象)</a>'
+            "</body></html>"
+        )
+        mock_resp = _make_mock_response(dummy_html)
+
+        # page 1: ダミーHTML を返す / page 2: None → ループ終了
+        with patch(
+            "src.data_pipeline.race_list_scraper.fetch_html",
+            side_effect=[mock_resp, None],
+        ):
+            result = get_race_list_urls("2025-11-01", "2025-11-03", logger)
+
+        assert isinstance(
+            result, list
+        ), f"戻り値が List 型ではありません: {type(result)}"
+        assert (
+            len(result) == 2
+        ), f"重複除去後の件数が一致しません: {len(result)} (期待値: 2)"
+        # 意図: 全 URL が絶対 URL に変換されていることを確認する
+        assert all(
+            u.startswith(BASE_URL) for u in result
+        ), f"絶対 URL への変換に失敗しています: {result}"
+        # 意図: 昇順ソートの検証 (R1=20251101 が R2=20251103 より前に並ぶ)
+        assert result == sorted(result), f"戻り値が昇順ソートされていません: {result}"
+        assert f"{BASE_URL}/race/result/20251101/01/01/" in result
+        assert f"{BASE_URL}/race/result/20251103/01/02/" in result
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 4: 正常系 (定数の妥当性検証)
+        # ---------------------------------------------------------
+        print("\n[TEST 4] 正常系: 定数の妥当性検証")
+        assert BASE_URL.startswith(
+            "https://"
+        ), f"BASE_URL が https:// で始まりません: {BASE_URL}"
+        assert MAX_PAGES > 0, f"MAX_PAGES が 0 以下です: {MAX_PAGES}"
+        assert isinstance(
+            RACE_URL_PATTERN, re.Pattern
+        ), "RACE_URL_PATTERN が re.Pattern 型ではありません"
+        # 意図: 正規パターンに合致するサンプル URL を検証する
+        assert RACE_URL_PATTERN.match(
+            "/race/result/20250803/01/01/"
+        ), "RACE_URL_PATTERN が正規 URL に一致しません"
+        # 意図: 馬情報ページが誤ってマッチしないことを検証する
+        assert not RACE_URL_PATTERN.match(
+            "/horse/2020101234/"
+        ), "RACE_URL_PATTERN が馬情報 URL に誤マッチしています"
+        print("  -> PASS")
+
+    except AssertionError as e:
+        print(f"\n[FAIL] アサーション失敗: {e}")
+    except Exception as e:
+        print(f"\n[FAIL] 予期しないエラー: {e}")
+        import traceback
+
+        traceback.print_exc()
+    finally:
+        close_logger_handlers(TEST_LOGGER_NAME)
+        if Path(TEST_LOG_DIR).exists():
+            shutil.rmtree(TEST_LOG_DIR)
+            print(f"\nCLEANUP: {TEST_LOG_DIR} を削除しました。")
+
     print("\n" + "=" * 60)
-    if errors:
-        print(f"  FAILED — {len(errors)} error(s):")
-        for msg in errors:
-            print(f"    ✗ {msg}")
-    else:
-        print("  ALL TESTS PASSED")
-    print("=" * 60 + "\n")
+    print(" 全テスト完了")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
+    # python -m src.data_pipeline.race_list_scraper
     _run_tests()

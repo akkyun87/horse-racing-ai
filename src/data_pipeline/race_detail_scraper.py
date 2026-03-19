@@ -13,17 +13,22 @@ JBIS レース結果ページ HTML を解析し、開催情報・レース概要
 【外部依存】
 - ネットワーク: JBIS (https://www.jbis.or.jp) への HTTP リクエスト
 - HTML 解析: BeautifulSoup4
-- HTTP 通信: src.utils.retry_requests.fetch_html
-- データモデル: src.data_pipeline.data_models
-  (RaceDetail, RaceInfo, RaceVenue, HorseEntry, Payout)
+- 内部モジュール:
+    src.utils.retry_requests (fetch_html)
+    src.utils.logger         (setup_logger, close_logger_handlers)
+    src.data_pipeline.data_models
+      (RaceDetail, RaceInfo, RaceVenue, HorseEntry, Payout)
 
 【Usage】
     from src.data_pipeline.race_detail_scraper import scrape_race_details
-    import logging
+    from src.utils.logger import setup_logger
 
-    logger = logging.getLogger(__name__)
-    urls   = ["https://www.jbis.or.jp/race/result/20251130/105/12/"]
-
+    logger = setup_logger(
+        log_filepath="logs/race_detail_scraper.log",
+        log_level="INFO",
+        logger_name="RaceDetailScraper",
+    )
+    urls    = ["https://www.jbis.or.jp/race/result/20251130/105/12/"]
     results = scrape_race_details(urls, logger)
 """
 
@@ -33,7 +38,9 @@ JBIS レース結果ページ HTML を解析し、開催情報・レース概要
 
 import logging
 import re
+import shutil
 import unicodedata
+from pathlib import Path
 from typing import Any, Dict, Final, List, Optional
 from urllib.parse import urljoin
 
@@ -60,6 +67,22 @@ _HORSE_TABLE_MIN_COLS: Final[int] = 15
 
 # JBIS 馬 ID の桁数: URL から ID を抽出する正規表現の基準となる
 _HORSE_ID_DIGITS: Final[int] = 10
+
+# レース格付けキーワード: レース名末尾との後方一致で格付けを判定する
+# 意図: 関数内での毎回再生成を避け、モジュールレベルで一元管理する
+GRADE_KEYWORDS: Final[List[str]] = [
+    "GI",
+    "GII",
+    "GIII",
+    "L",
+    "重賞",
+    "オープン",
+    "1勝クラス",
+    "2勝クラス",
+    "3勝クラス",
+    "新馬",
+    "未勝利",
+]
 
 
 # ---------------------------------------------------------
@@ -132,11 +155,16 @@ def safe_float(text: Optional[str]) -> Optional[float]:
     """
     文字列から数値 (小数点含む) を抽出し、安全に float へ変換する。
 
+    JBIS のレースタイムは「2:31.5」(分:秒) 形式で記録されるため、
+    コロンが含まれる場合は分×60＋秒に変換して秒数として返す。
+
     Args:
-        text (Optional[str]): 数値を含む文字列 (例: "34.5kg")。
+        text (Optional[str]): 数値を含む文字列 (例: "34.5kg", "2:31.5")。
+                              コロン区切りの分:秒形式にも対応する。
 
     Returns:
         Optional[float]: 抽出された浮動小数点数。変換不能な場合は None。
+                         分:秒形式の場合は秒数に変換した値を返す。
 
     Raises:
         None: 本関数は例外を外部へ伝播しない。
@@ -144,12 +172,23 @@ def safe_float(text: Optional[str]) -> Optional[float]:
     Example:
         >>> safe_float("34.5kg")
         34.5
+        >>> safe_float("2:31.5")
+        151.5
         >>> safe_float("N/A")
         None
     """
     try:
         if text is None:
             return None
+
+        # 意図: JBIS のレースタイムは「2:31.5」(分:秒) 形式で記録されるため
+        #       コロン区切りを検出して秒数へ変換する
+        if ":" in text:
+            try:
+                m, s = text.split(":")
+                return round(int(m) * 60 + float(s), 1)
+            except ValueError:
+                return None
 
         # 数字と小数点以外の文字をすべて除去する
         cleaned = re.sub(r"[^\d\.]", "", text)
@@ -240,6 +279,7 @@ def extract_race_data(
         "race": {
             "number": None,
             "name": None,
+            "grade": None,
             "surface": None,
             "distance_m": None,
             "weather": None,
@@ -286,20 +326,37 @@ def extract_race_data(
         logger.error(f"開催情報のパース中に例外が発生: {e}")
 
     # ---------------------------------------------------------
-    # 2. レース概要 (番号・名称・馬場・距離・天候・馬場状態)
+    # 2. レース概要 (番号・名称・格付け・馬場・距離・天候・馬場状態)
     # ---------------------------------------------------------
 
     try:
         race_title_tag = soup.select_one(".hdg2-l-1 h2")
-
         if race_title_tag:
-            race_title = race_title_tag.get_text(strip=True)
 
-            # 「12R ジャパンカップ」形式からレース番号と名称を分離する
-            title_match = re.match(r"(\d+)R\s+(.*)", race_title)
-            if title_match:
-                data["race"]["number"] = safe_int(title_match.group(1))
-                data["race"]["name"] = title_match.group(2)
+            # 例: "11R 有馬記念GⅠ", "11R 白富士SL", "4R サラ系３歳 新馬"
+            race_title = to_halfwidth(race_title_tag.get_text(strip=True))
+
+            # 1. まず先頭の「11R 」などのレース番号を切り分ける
+            title_parts = race_title.split(maxsplit=1)
+            if len(title_parts) == 2:
+                data["race"]["number"] = safe_int(title_parts[0])
+                full_name = title_parts[1]  # 例: "有馬記念GⅠ", "サラ系３歳 新馬"
+
+                # 2. GRADE_KEYWORDS 定数で後方一致を確認する
+                # 意図: ループはモジュール定数を参照し、毎呼び出しでリストを再生成しない
+                found_grade = None
+                clean_name = full_name
+
+                for grade in GRADE_KEYWORDS:
+                    if full_name.endswith(grade):
+                        found_grade = grade
+                        # 末尾から格付け文字数分をカットしてレース名とする
+                        clean_name = full_name[: -len(grade)].strip()
+                        break
+
+                # 格付けが見つからなかった場合は clean_name = full_name のまま
+                data["race"]["name"] = clean_name
+                data["race"]["grade"] = found_grade
 
         cond_tag = soup.select_one(".box-race__text")
 
@@ -329,38 +386,54 @@ def extract_race_data(
         logger.error(f"レース概要のパース中に例外が発生: {e}")
 
     # ---------------------------------------------------------
-    # 3. タイム情報 (上がり3ハロン・ラップ・コーナー通過順)
+    # 3. タイム情報 (上がり・ラップ・コーナー通過順・各種タイム計算)
     # ---------------------------------------------------------
 
     try:
-        # 上がりタイムは <dt>上がり</dt><dd>XX.X</dd> の隣接関係から取得する
-        agari_dt = soup.find("dt", string="上がり")
-        if agari_dt:
-            agari_dd = agari_dt.find_next_sibling("dd")
-            if agari_dd:
-                data["race"]["final_time"] = agari_dd.get_text(strip=True)
-
-        # ハロンタイム (ラップ) は同様の <dt><dd> 構造から数値リストとして取得する
+        # --- ハロンタイム (ラップ) の取得と計算 ---
         h_time_dt = soup.find("dt", string="ハロンタイム")
         if h_time_dt:
             h_time_dd = h_time_dt.find_next_sibling("dd")
             if h_time_dd:
                 lap_text = h_time_dd.get_text(strip=True)
-                # "XX.X" 形式の数値をすべて抽出し float リスト化する
-                data["race"]["lap_time"] = [
+                laps = [
                     val
                     for x in re.findall(r"\d+\.\d+", lap_text)
                     if (val := safe_float(x)) is not None
                 ]
+                data["race"]["lap_time"] = laps
 
-        # 各コーナーの通過順は ".data-4-1" コンテナ内の <dt><dd> ペアから取得する
+                if laps:
+                    # 1. レース総タイム (race_time)
+                    data["race"]["race_time"] = round(sum(laps), 1)
+
+                    # 2. 前半3F (first_3f) ※正規化版
+                    # 最初の3ラップがカバーする距離を判定
+                    dist = data["race"].get("distance_m")
+                    if dist and len(laps) >= 3:
+                        # 200mで割り切れない（100m端数あり）場合は最初の3ラップは500m分
+                        f3_dist = 500 if (dist % 200 != 0) else 600
+                        f3_sum_time = sum(laps[:3])
+
+                        # (合計タイム / 合計距離) * 600m で 3F換算
+                        normalized_f3f = (f3_sum_time / f3_dist) * 600
+                        data["race"]["first_3f"] = round(normalized_f3f, 1)
+                    elif len(laps) >= 3:
+                        # 距離不明時のフォールバック（単純合計）
+                        data["race"]["first_3f"] = round(sum(laps[:3]), 1)
+
+                    # 3. 後半3F (last_3f)
+                    # 日本の競馬は常にラスト600m地点から計測されるため、常に末尾3ラップの合計でOK
+                    if len(laps) >= 3:
+                        data["race"]["last_3f"] = round(sum(laps[-3:]), 1)
+
+        # --- コーナー通過順の取得 ---
         corner_container = soup.select_one(".data-4-1")
         if corner_container:
             for item in corner_container.select(".data-4__item"):
                 c_name = item.dt.get_text(strip=True) if item.dt else ""
                 order_text = item.dd.get_text(strip=True) if item.dd else ""
                 if c_name:
-                    # 通過順は空白やハイフンで区切られた数字列として格納される
                     data["race"]["corner_order"][c_name] = [
                         int(n) for n in re.findall(r"\d+", order_text)
                     ]
@@ -432,11 +505,11 @@ def extract_race_data(
                     "rank": safe_int(cols[0].get_text()),
                     "frame": safe_int(cols[1].get_text()),
                     "number": safe_int(cols[2].get_text()),
-                    "name": name,
+                    "name": to_halfwidth(name),
                     "url": url,
-                    "sex": sex,
+                    "sex": to_halfwidth(sex),
                     "age": age,
-                    "jockey": jockey_name,
+                    "jockey": to_halfwidth(jockey_name),
                     "weight": j_weight,
                     "time": safe_float(cols[6].get_text()),
                     "margin": cols[7].get_text(strip=True) or None,
@@ -448,10 +521,12 @@ def extract_race_data(
                     "popularity": safe_int(cols[11].get_text()),
                     "body_weight": body_weight,
                     "diff_from_prev": diff,
-                    "trainer_name": t_name,
-                    "trainer_region": t_region,
-                    "owner": owner,
-                    "breeder": breeder,
+                    "trainer_name": to_halfwidth(t_name),
+                    # 意図: to_halfwidth が None を返す可能性があるため or "" でガードしてから
+                    #       全角スペース除去を適用する（栗 東 → 栗東）
+                    "trainer_region": (to_halfwidth(t_region) or "").replace(" ", ""),
+                    "owner": to_halfwidth(owner),
+                    "breeder": to_halfwidth(breeder),
                 }
             )
 
@@ -547,11 +622,14 @@ def generate_race_objects(
         race = RaceInfo(
             number=r_raw.get("number", 0),
             name=to_halfwidth(r_raw.get("name", "")),
+            grade=to_halfwidth(r_raw.get("grade", "")),
             surface=to_halfwidth(r_raw.get("surface", "")),
             distance_m=r_raw.get("distance_m", 0),
             weather=to_halfwidth(r_raw.get("weather", "")),
             track_condition=to_halfwidth(r_raw.get("track_condition", "")),
-            final_time=to_halfwidth(r_raw.get("final_time", "")),
+            race_time=r_raw.get("race_time", 0.0),
+            first_3f=r_raw.get("first_3f", 0.0),
+            last_3f=r_raw.get("last_3f", 0.0),
             lap_time=r_raw.get("lap_time", []),
             corner_order={
                 to_halfwidth(k): v for k, v in r_raw.get("corner_order", {}).items()
@@ -623,6 +701,7 @@ def scrape_race_details(
         None: 各 URL の例外は内部でキャッチしログ出力するため外部へ伝播しない。
 
     Example:
+        >>> logger = setup_logger("logs/race_detail.log", logger_name="RaceDetailScraper")
         >>> urls = ["https://www.jbis.or.jp/race/result/20251130/105/12/"]
         >>> details = scrape_race_details(urls, logger)
         >>> len(details)
@@ -642,7 +721,7 @@ def scrape_race_details(
             # リトライ処理は fetch_html 側で実装されているため直接呼び出す
             response = fetch_html(url, logger)
 
-            if not response or not response.text:
+            if response is None or not getattr(response, "text", None):
                 logger.error(f"HTML の取得に失敗したためスキップします: {url}")
                 continue
 
@@ -651,6 +730,11 @@ def scrape_race_details(
             # ---------------------------------------------------------
 
             raw_data = extract_race_data(response.text, logger)
+
+            if not raw_data or not raw_data.get("horses"):
+                logger.warning(f"データが空のためスキップします: {url}")
+                continue
+
             detail = generate_race_objects(raw_data, logger)
 
             results.append(detail)
@@ -669,162 +753,284 @@ def scrape_race_details(
 
 
 def _run_tests() -> None:
-    """主要機能の動作確認テストを実行する。
-
-    正常系・異常系の双方を検証し、外部依存がある場合はダミーデータで代替する。
-    全テストが通過した場合のみ "ALL TESTS PASSED" を表示する。
     """
-    import sys
+    主要機能の動作確認テストを実行する。
 
-    # ---- ログ設定 ----
-    test_logger = logging.getLogger("test_scraper")
-    test_logger.setLevel(logging.DEBUG)
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    test_logger.addHandler(handler)
+    fetch_html を unittest.mock.patch でモックすることで外部ネットワークへの
+    依存を排除し、単体実行を可能にする。
+    テスト終了後はログファイルとロガーをすべて解放・削除する。
 
-    print("\n" + "=" * 60)
-    print("  Unit Test: src/data_pipeline/race_detail_scraper.py")
-    print("=" * 60 + "\n")
+    Args:
+        なし。
 
-    errors: List[str] = []
+    Returns:
+        None: 戻り値なし。テスト結果は標準出力に print する。
 
-    # ---------------------------------------------------------
-    # [Test 1] to_halfwidth: 全角→半角・全角スペース置換
-    # ---------------------------------------------------------
-    print("[Test 1] to_halfwidth")
-    cases = [
-        ("１２３４　（テスト）", "1234 (テスト)"),
-        (None, None),
-        ("", ""),
-        ("ABC", "ABC"),
-    ]
-    for raw, expected in cases:
-        result = to_halfwidth(raw)
-        status = "OK" if result == expected else "FAIL"
-        print(
-            f"  {status}: to_halfwidth({raw!r}) -> {result!r} (expected: {expected!r})"
-        )
-        if status == "FAIL":
-            errors.append(f"to_halfwidth({raw!r}) returned {result!r}")
+    Raises:
+        None: AssertionError および予期しない例外は内部でキャッチして出力する。
 
-    # ---------------------------------------------------------
-    # [Test 2] safe_int: 正常系・異常系
-    # ---------------------------------------------------------
-    print("\n[Test 2] safe_int")
-    int_cases = [
-        ("1,234円", 1234),
-        ("0", 0),
-        ("", None),
-        (None, None),
-        ("abc", None),
-    ]
-    for raw, expected in int_cases:
-        result = safe_int(raw)
-        status = "OK" if result == expected else "FAIL"
-        print(f"  {status}: safe_int({raw!r}) -> {result!r} (expected: {expected!r})")
-        if status == "FAIL":
-            errors.append(f"safe_int({raw!r}) returned {result!r}")
+    Example:
+        # python -m src.data_pipeline.race_detail_scraper
+        _run_tests()
+    """
+    from unittest.mock import MagicMock, patch
 
-    # ---------------------------------------------------------
-    # [Test 3] safe_float: 正常系・異常系
-    # ---------------------------------------------------------
-    print("\n[Test 3] safe_float")
-    float_cases = [
-        ("34.5kg", 34.5),
-        ("1.0", 1.0),
-        ("", None),
-        (None, None),
-    ]
-    for raw, expected in float_cases:
-        result = safe_float(raw)
-        status = "OK" if result == expected else "FAIL"
-        print(f"  {status}: safe_float({raw!r}) -> {result!r} (expected: {expected!r})")
-        if status == "FAIL":
-            errors.append(f"safe_float({raw!r}) returned {result!r}")
+    from src.utils.logger import close_logger_handlers, setup_logger
 
-    # ---------------------------------------------------------
-    # [Test 4] extract_id_from_url: URL パースの正常系・異常系
-    # ---------------------------------------------------------
-    print("\n[Test 4] extract_id_from_url")
-    url_cases = [
-        ("/horse/2020101234/", "2020101234"),
-        ("https://www.jbis.or.jp/horse/1999100001/profile/", "1999100001"),
-        ("/horse/123/", ""),  # 桁数不足
-        (None, ""),
-        ("", ""),
-    ]
-    for raw, expected in url_cases:
-        result = extract_id_from_url(raw)
-        status = "OK" if result == expected else "FAIL"
-        print(f"  {status}: extract_id_from_url({raw!r}) -> {result!r}")
-        if status == "FAIL":
-            errors.append(f"extract_id_from_url({raw!r}) returned {result!r}")
+    TEST_LOG_DIR: Final[str] = "logs/_test_race_detail_scraper_tmp"
+    TEST_LOG_FILE: Final[str] = f"{TEST_LOG_DIR}/test.log"
+    TEST_LOGGER_NAME: Final[str] = "test_race_detail_scraper"
 
-    # ---------------------------------------------------------
-    # [Test 5] extract_race_data: ダミー HTML による結合テスト
-    # ---------------------------------------------------------
-    print("\n[Test 5] extract_race_data (dummy HTML)")
-    dummy_html = """
+    # scrape_race_details の結合テストで使用するダミーHTML
+    # 意図: 実ページの最小構造を再現し、パース〜オブジェクト変換の一気通貫を検証する
+    DUMMY_HTML: Final[
+        str
+    ] = """
     <html><body>
-      <div class="hdg1-search"><h1>2025年11月30日(日) 3回 東京 5日</h1></div>
-      <div class="hdg2-l-1"><h2>12R ジャパンカップ</h2></div>
-      <div class="box-race__text">芝2400M 天候：晴 芝：良</div>
+
+    <div class="hdg1-search">
+    <h1>2025年11月30日(日) 3回 東京 5日</h1>
+    </div>
+
+    <div class="hdg2-l-1">
+    <h2>12R ジャパンカップ</h2>
+    </div>
+
+    <div class="box-race__text">
+    芝2400M 天候：晴 芝：良
+    </div>
+
+    <div class="data-6-11 sort-1">
+
+    <div></div> <!-- header -->
+
+    <div>
+    <div><span class="number-1">1</span></div>
+    <div><span class="frameNumber-1">1</span></div>
+    <div class="jc-right">2番</div>
+
+    <div class="jc-left">
+    <div>
+    <a href="/horse/0001155349/" class="txt-link">キタサンブラック</a>
+    <div class="data-6__small">
+    <p class="txt-overflow">父：ブラックタイド</p>
+    <p class="txt-overflow">母：シュガーハート</p>
+    </div>
+    </div>
+    </div>
+
+    <div><span class="txt-male">牡5</span></div>
+
+    <div class="data-6__lyt-1">
+    <a href="/race/jockey/J00666/" class="txt-link txt-overflow">武 豊</a>
+    <span class="ta-right">57.0</span>
+    </div>
+
+    <div class="jc-right">2:33.6</div>
+
+    <div>---</div>
+
+    <div>1-1-1-1</div>
+
+    <div class="jc-right">35.2</div>
+
+    <div class="jc-right">114.9</div>
+
+    <div class="jc-right">1人気</div>
+
+    <div class="jc-right"><span class="ta-right">540（-2）</span></div>
+
+    <div class="jc-left">
+    <span class="txt-overflow">
+    <a href="/race/trainer/J01110/" class="txt-link txt-overflow">清水 久詞</a>(栗 東)
+    </span>
+    </div>
+
+    <div class="jc-left">
+    <span>
+    <a href="/race/owner/J900181/" class="txt-link txt-overflow">(有) 大野商事</a>
+    <a href="/breeder/0000001432/" class="txt-link txt-overflow">ヤナガワ牧場</a>
+    </span>
+    </div>
+
+    </div>
+
+    </div>
+
     </body></html>
     """
-    raw = extract_race_data(dummy_html, test_logger)
 
-    checks = [
-        ("date", raw.get("date"), "2025-11-30"),
-        ("weekday", raw.get("weekday"), "日"),
-        ("venue.place", raw["venue"]["place"], "東京"),
-        ("venue.round", raw["venue"]["round"], 3),
-        ("race.number", raw["race"]["number"], 12),
-        ("race.name", raw["race"]["name"], "ジャパンカップ"),
-        ("race.surface", raw["race"]["surface"], "芝"),
-        ("race.distance_m", raw["race"]["distance_m"], 2400),
-        ("race.weather", raw["race"]["weather"], "晴"),
-        ("race.track_cond", raw["race"]["track_condition"], "良"),
-    ]
-    for label, actual, expected in checks:
-        status = "OK" if actual == expected else "FAIL"
-        print(f"  {status}: {label} -> {actual!r} (expected: {expected!r})")
-        if status == "FAIL":
-            errors.append(
-                f"extract_race_data[{label}] = {actual!r}, expected {expected!r}"
-            )
+    print("=" * 60)
+    print(" race_detail_scraper.py 簡易単体テスト 開始")
+    print("=" * 60)
 
-    # ---------------------------------------------------------
-    # [Test 6] scrape_race_details: 実ネットワーク疎通確認 (オプション)
-    # ---------------------------------------------------------
-    print("\n[Test 6] scrape_race_details (live network — skip if unavailable)")
-    test_url = "https://www.jbis.or.jp/race/result/20251130/105/12/"
+    logger = setup_logger(
+        log_filepath=TEST_LOG_FILE,
+        log_level="DEBUG",
+        logger_name=TEST_LOGGER_NAME,
+    )
+
     try:
-        details = scrape_race_details([test_url], test_logger)
-        if details:
-            d = details[0]
-            print(
-                f"  OK: Date={d.date} Venue={d.venue.place} Race={d.race.number}R Horses={len(d.horses)}"
-            )
-            if d.race.number != 12:
-                errors.append(f"race.number expected 12, got {d.race.number}")
-        else:
-            print("  SKIP: No data returned. Network may be unavailable.")
-    except Exception as e:
-        print(f"  SKIP: Network test skipped due to exception: {e}")
+        # ---------------------------------------------------------
+        # テスト 1: to_halfwidth (正常系・None・空文字)
+        # ---------------------------------------------------------
+        print("\n[TEST 1] 正常系/異常系: to_halfwidth の全角→半角変換")
+        cases = [
+            ("１２３４　（テスト）", "1234 (テスト)"),
+            (None, None),
+            ("", ""),
+            ("ABC", "ABC"),
+        ]
+        for raw, expected in cases:
+            result = to_halfwidth(raw)
+            assert (
+                result == expected
+            ), f"to_halfwidth({raw!r}) -> {result!r} (期待値: {expected!r})"
+        print("  -> PASS")
 
-    # ---------------------------------------------------------
-    # テスト結果サマリ
-    # ---------------------------------------------------------
+        # ---------------------------------------------------------
+        # テスト 2: safe_int (正常系・異常系)
+        # ---------------------------------------------------------
+        print("\n[TEST 2] 正常系/異常系: safe_int の数値変換")
+        int_cases = [
+            ("1,234円", 1234),
+            ("0", 0),
+            ("", None),
+            (None, None),
+            ("abc", None),
+        ]
+        for raw, expected in int_cases:
+            result = safe_int(raw)
+            assert (
+                result == expected
+            ), f"safe_int({raw!r}) -> {result!r} (期待値: {expected!r})"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 3: safe_float (正常系・分:秒形式・異常系)
+        # ---------------------------------------------------------
+        print("\n[TEST 3] 正常系/異常系: safe_float の数値変換")
+        float_cases = [
+            ("34.5kg", 34.5),
+            ("1.0", 1.0),
+            # 意図: JBIS のレースタイム「分:秒」形式の変換を検証する
+            ("2:31.5", 151.5),  # 2×60 + 31.5 = 151.5
+            ("", None),
+            (None, None),
+        ]
+        for raw, expected in float_cases:
+            result = safe_float(raw)
+            assert (
+                result == expected
+            ), f"safe_float({raw!r}) -> {result!r} (期待値: {expected!r})"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 4: extract_id_from_url (正常系・桁数不足・None)
+        # ---------------------------------------------------------
+        print("\n[TEST 4] 正常系/異常系: extract_id_from_url の馬 ID 抽出")
+        url_cases = [
+            ("/horse/2020101234/", "2020101234"),
+            ("https://www.jbis.or.jp/horse/1999100001/profile/", "1999100001"),
+            ("/horse/123/", ""),  # 意図: 桁数不足はパターン不一致として空文字を返す
+            (None, ""),
+            ("", ""),
+        ]
+        for raw, expected in url_cases:
+            result = extract_id_from_url(raw)
+            assert (
+                result == expected
+            ), f"extract_id_from_url({raw!r}) -> {result!r} (期待値: {expected!r})"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 5: extract_race_data (ダミー HTML によるパース結合テスト)
+        # ---------------------------------------------------------
+        print("\n[TEST 5] 正常系: extract_race_data のダミー HTML パース検証")
+        raw = extract_race_data(DUMMY_HTML, logger)
+        checks = [
+            ("date", raw.get("date"), "2025-11-30"),
+            ("weekday", raw.get("weekday"), "日"),
+            ("venue.place", raw["venue"]["place"], "東京"),
+            ("venue.round", raw["venue"]["round"], 3),
+            ("race.number", raw["race"]["number"], 12),
+            ("race.name", raw["race"]["name"], "ジャパンカップ"),
+            ("race.surface", raw["race"]["surface"], "芝"),
+            ("race.distance_m", raw["race"]["distance_m"], 2400),
+            ("race.weather", raw["race"]["weather"], "晴"),
+            ("race.track_cond", raw["race"]["track_condition"], "良"),
+        ]
+        for label, actual, expected in checks:
+            assert (
+                actual == expected
+            ), f"extract_race_data[{label}] -> {actual!r} (期待値: {expected!r})"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 6: scrape_race_details (fetch_html モックによる結合テスト)
+        # ---------------------------------------------------------
+        print("\n[TEST 6] 正常系: scrape_race_details のモック結合テスト")
+        # 意図: fetch_html をモックしてネットワーク不要でパース〜オブジェクト変換を検証する
+        mock_response = MagicMock()
+        mock_response.text = DUMMY_HTML
+        # `if not response` の判定が False になるよう __bool__ は True を維持する
+        mock_response.__bool__ = MagicMock(return_value=True)
+
+        # 意図: モジュール内で import された fetch_html を差し替えるため
+        #       "src.data_pipeline.race_detail_scraper.fetch_html" を指定する
+        with patch(
+            "src.data_pipeline.race_detail_scraper.fetch_html",
+            return_value=mock_response,
+        ):
+            details = scrape_race_details(
+                ["https://www.jbis.or.jp/race/result/20251130/105/12/"],
+                logger,
+            )
+
+        assert len(details) == 1, f"返却件数が一致しません: {len(details)} (期待値: 1)"
+        d = details[0]
+        assert d.date == "2025-11-30", f"date が一致しません: {d.date!r}"
+        assert d.venue.place == "東京", f"venue.place が一致しません: {d.venue.place!r}"
+        assert d.race.number == 12, f"race.number が一致しません: {d.race.number}"
+        assert d.race.name == "ジャパンC", f"race.name が一致しません: {d.race.name!r}"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 7: 異常系 (fetch_html=None → 空リスト返却)
+        # ---------------------------------------------------------
+        print("\n[TEST 7] 異常系: fetch_html=None 時に空リストが返ること")
+        # 意図: ネットワーク断等で fetch_html が None を返した場合のフォールバックを検証する
+        with patch(
+            "src.data_pipeline.race_detail_scraper.fetch_html",
+            return_value=None,
+        ):
+            details = scrape_race_details(
+                ["https://www.jbis.or.jp/race/result/20251130/105/12/"],
+                logger,
+            )
+        assert (
+            details == []
+        ), f"fetch_html=None のとき空リスト以外が返りました: {details}"
+        print("  -> PASS")
+
+    except AssertionError as e:
+        print(f"\n[FAIL] アサーション失敗: {e}")
+    except Exception as e:
+        print(f"\n[FAIL] 予期しないエラー: {e}")
+        import traceback
+
+        traceback.print_exc()
+    finally:
+        close_logger_handlers(TEST_LOGGER_NAME)
+        if Path(TEST_LOG_DIR).exists():
+            shutil.rmtree(TEST_LOG_DIR)
+            print(f"\nCLEANUP: {TEST_LOG_DIR} を削除しました。")
+
     print("\n" + "=" * 60)
-    if errors:
-        print(f"  FAILED — {len(errors)} error(s):")
-        for msg in errors:
-            print(f"    ✗ {msg}")
-    else:
-        print("  ALL TESTS PASSED")
-    print("=" * 60 + "\n")
+    print(" 全テスト完了")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
+    # python -m src.data_pipeline.race_detail_scraper
     _run_tests()

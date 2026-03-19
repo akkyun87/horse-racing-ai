@@ -13,12 +13,18 @@ JSON および YAML 形式のファイル入出力処理を共通化するユー
 【外部依存】
 - ライブラリ: PyYAML (yaml)
 - ファイルシステム: 対象ディレクトリへの書き込み権限が必要
+- 内部モジュール:
+    src.utils.logger (setup_logger, close_logger_handlers)
 
 【Usage】
     from src.utils.file_manager import save_data, load_data
-    import logging
+    from src.utils.logger import setup_logger
 
-    logger = logging.getLogger(__name__)
+    logger = setup_logger(
+        log_filepath="logs/file_manager.log",
+        log_level="INFO",
+        logger_name="FileManager",
+    )
 
     data = {"race_id": "20240101", "weather": "Sunny", "track_condition": "Good"}
 
@@ -47,8 +53,8 @@ import yaml
 # ---------------------------------------------------------
 
 # 対応している拡張子の定義
-SUPPORTED_JSON_EXTS: Final = (".json",)
-SUPPORTED_YAML_EXTS: Final = (".yaml", ".yml")
+SUPPORTED_JSON_EXTS: Final[tuple[str, ...]] = (".json",)
+SUPPORTED_YAML_EXTS: Final[tuple[str, ...]] = (".yaml", ".yml")
 
 
 # ---------------------------------------------------------
@@ -57,7 +63,10 @@ SUPPORTED_YAML_EXTS: Final = (".yaml", ".yml")
 
 
 def _save_json(
-    data: Dict[str, Any], file_path: Path, indent: int = 4, ensure_ascii: bool = False
+    data: Dict[str, Any],
+    file_path: Path,
+    indent: int = 4,
+    ensure_ascii: bool = False,
 ) -> None:
     """
     辞書データを JSON 形式でファイルへ書き出す。
@@ -67,10 +76,17 @@ def _save_json(
         file_path (Path): 保存先の Path オブジェクト。
         indent (int): インデントの幅。デフォルトは 4。
         ensure_ascii (bool): True の場合、非 ASCII 文字をエスケープする。
-                            日本語を保持するためデフォルトは False。
+                             日本語を保持するためデフォルトは False。
 
     Returns:
-        None
+        None: 戻り値なし（副作用としてファイルを書き出す）。
+
+    Raises:
+        json.JSONEncodeError: データのシリアライズに失敗した場合。
+        OSError: ファイルへの書き込みに失敗した場合。
+
+    Example:
+        >>> _save_json({"key": "val"}, Path("out.json"))
     """
     with file_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=ensure_ascii, indent=indent)
@@ -85,6 +101,13 @@ def _load_json(file_path: Path) -> Dict[str, Any]:
 
     Returns:
         Dict[str, Any]: パースされた辞書データ。
+
+    Raises:
+        json.JSONDecodeError: JSON のパースに失敗した場合。
+        OSError: ファイルの読み込みに失敗した場合。
+
+    Example:
+        >>> data = _load_json(Path("input.json"))
     """
     with file_path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -104,7 +127,14 @@ def _save_yaml(data: Dict[str, Any], file_path: Path) -> None:
         file_path (Path): 保存先の Path オブジェクト。
 
     Returns:
-        None
+        None: 戻り値なし（副作用としてファイルを書き出す）。
+
+    Raises:
+        yaml.YAMLError: データのシリアライズに失敗した場合。
+        OSError: ファイルへの書き込みに失敗した場合。
+
+    Example:
+        >>> _save_yaml({"key": "val"}, Path("out.yaml"))
     """
     with file_path.open("w", encoding="utf-8") as f:
         # allow_unicode=True により日本語をネイティブな文字として出力
@@ -121,6 +151,13 @@ def _load_yaml(file_path: Path) -> Dict[str, Any]:
 
     Returns:
         Dict[str, Any]: パースされた辞書データ。
+
+    Raises:
+        yaml.YAMLError: YAML のパースに失敗した場合。
+        OSError: ファイルの読み込みに失敗した場合。
+
+    Example:
+        >>> data = _load_yaml(Path("config.yaml"))
     """
     with file_path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -152,10 +189,16 @@ def save_data(
     Returns:
         bool: 保存に成功した場合は True、バリデーション失敗や I/O エラー時は False。
 
-    Example:
-        >>> success = save_data({"key": "value"}, "output.json", logger)
-    """
+    Raises:
+        None: json.JSONEncodeError / yaml.YAMLError / OSError は内部で捕捉し、
+              ERROR ログを出力する。
 
+    Example:
+        >>> logger = setup_logger("logs/file_manager.log", logger_name="FileManager")
+        >>> success = save_data({"key": "value"}, "output.json", logger)
+        >>> print(success)
+        True
+    """
     # ---------------------------------------------------------
     # 入力バリデーション
     # ---------------------------------------------------------
@@ -221,8 +264,17 @@ def load_data(file_path: str, logger: logging.Logger) -> Optional[Dict[str, Any]
         Optional[Dict[str, Any]]:
             成功時: 読み込んだデータの辞書。
             ファイル未存在、未対応形式、またはパースエラー時: None。
-    """
 
+    Raises:
+        None: json.JSONDecodeError / yaml.YAMLError / OSError は内部で捕捉し、
+              ERROR ログを出力する。
+
+    Example:
+        >>> logger = setup_logger("logs/file_manager.log", logger_name="FileManager")
+        >>> config = load_data("config/settings.yaml", logger)
+        >>> if config is not None:
+        ...     print(config.get("race_id"))
+    """
     # ---------------------------------------------------------
     # 読み込み前チェック
     # ---------------------------------------------------------
@@ -267,27 +319,38 @@ def _run_tests() -> None:
     """
     主要機能の動作確認テストを実行する。
 
-    正常系（JSON/YAML）、異常系（未対応拡張子、不在ファイル）を検証し、
-    テスト完了後に一時ファイルをクリーンアップする。
+    外部依存（DB・ネットワーク）を持たず、一時ディレクトリ上のファイルのみを使用するため
+    単体実行が可能。テスト終了後はファイル・ロガーをすべて解放・削除する。
+
+    Args:
+        なし。
+
+    Returns:
+        None: 戻り値なし。テスト結果は標準出力に print する。
+
+    Raises:
+        None: AssertionError および予期しない例外は内部でキャッチして出力する。
+
+    Example:
+        # python -m src.utils.file_manager
+        _run_tests()
     """
-    import sys
+    from src.utils.logger import close_logger_handlers, setup_logger
 
-    # ---- ログ設定 ----
-    test_logger = logging.getLogger("test_file_manager")
-    test_logger.setLevel(logging.DEBUG)
-    if not test_logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-        test_logger.addHandler(handler)
+    TEST_LOG_DIR: Final[str] = "logs/_test_file_manager_tmp"
+    TEST_DATA_DIR: Final[str] = "data/_test_file_manager_tmp"
+    TEST_LOG_FILE: Final[str] = f"{TEST_LOG_DIR}/test.log"
+    TEST_LOGGER_NAME: Final[str] = "test_file_manager"
 
-    # ---- テスト用一時パス ----
-    test_dir = Path("tmp_test_file_manager")
+    print("=" * 60)
+    print(" file_manager.py 簡易単体テスト 開始")
+    print("=" * 60)
 
-    print("\n" + "=" * 60)
-    print("   Unit Test: src/utils/file_manager.py")
-    print("=" * 60 + "\n")
-
-    errors: list[str] = []
+    logger = setup_logger(
+        log_filepath=TEST_LOG_FILE,
+        log_level="DEBUG",
+        logger_name=TEST_LOGGER_NAME,
+    )
 
     try:
         sample_data = {
@@ -297,81 +360,76 @@ def _run_tests() -> None:
         }
 
         # ---------------------------------------------------------
-        # [Test 1] JSON 形式 — 保存と読込
+        # テスト 1: 正常系 (JSON 保存と読み込み)
         # ---------------------------------------------------------
-        print("[Test 1] JSON 形式 — 保存と読込")
-        json_path = str(test_dir / "test.json")
-
-        save_res = save_data(sample_data, json_path, test_logger)
-        load_res = load_data(json_path, test_logger)
-
-        ok = (save_res is True) and (load_res == sample_data)
-        status = "OK" if ok else "FAIL"
-        print(f"   {status}: save_data() and load_data()一致確認")
-        if status == "FAIL":
-            errors.append("JSON 正常系の保存・読込が一致しません。")
+        print("\n[TEST 1] 正常系: JSON 形式の保存と読み込み一致確認")
+        json_path = f"{TEST_DATA_DIR}/test.json"
+        save_res = save_data(sample_data, json_path, logger)
+        assert save_res is True, "JSON 保存が失敗しました"
+        load_res = load_data(json_path, logger)
+        assert load_res == sample_data, f"JSON 読み込みデータが一致しません: {load_res}"
+        print("  -> PASS")
 
         # ---------------------------------------------------------
-        # [Test 2] YAML 形式 — 保存と読込
+        # テスト 2: 正常系 (YAML 保存と読み込み)
         # ---------------------------------------------------------
-        print("\n[Test 2] YAML 形式 — 保存と読込")
-        yaml_path = str(test_dir / "test.yaml")
-
-        save_res = save_data(sample_data, yaml_path, test_logger)
-        load_res = load_data(yaml_path, test_logger)
-
-        ok = (save_res is True) and (load_res == sample_data)
-        status = "OK" if ok else "FAIL"
-        print(f"   {status}: save_data() and load_data()一致確認")
-        if status == "FAIL":
-            errors.append("YAML 正常系の保存・読込が一致しません。")
+        print("\n[TEST 2] 正常系: YAML 形式の保存と読み込み一致確認")
+        yaml_path = f"{TEST_DATA_DIR}/test.yaml"
+        save_res = save_data(sample_data, yaml_path, logger)
+        assert save_res is True, "YAML 保存が失敗しました"
+        load_res = load_data(yaml_path, logger)
+        assert load_res == sample_data, f"YAML 読み込みデータが一致しません: {load_res}"
+        print("  -> PASS")
 
         # ---------------------------------------------------------
-        # [Test 3] 異常系 — 未対応拡張子
+        # テスト 3: 異常系 (未対応拡張子の拒絶)
         # ---------------------------------------------------------
-        print("\n[Test 3] 未対応拡張子の拒否")
-        invalid_path = str(test_dir / "test.txt")
-        result = save_data(sample_data, invalid_path, test_logger)
-
-        status = "OK" if result is False else "FAIL"
-        print(f"   {status}: .txt の保存が拒否されること -> {result}")
-        if status == "FAIL":
-            errors.append("未対応拡張子 .txt が受け入れられてしまいました。")
+        print("\n[TEST 3] 異常系: 未対応拡張子 .txt の保存が拒絶されること")
+        invalid_path = f"{TEST_DATA_DIR}/test.txt"
+        result = save_data(sample_data, invalid_path, logger)
+        assert result is False, f"未対応拡張子が受け入れられてしまいました: {result}"
+        print("  -> PASS")
 
         # ---------------------------------------------------------
-        # [Test 4] 異常系 — 存在しないファイル読込
+        # テスト 4: 異常系 (存在しないファイルの読み込み)
         # ---------------------------------------------------------
-        print("\n[Test 4] 存在しないファイルの読込")
-        result = load_data("nonexistent_file.json", test_logger)
+        print("\n[TEST 4] 異常系: 存在しないファイル読み込みで None 返却")
+        result = load_data(f"{TEST_DATA_DIR}/nonexistent.json", logger)
+        assert result is None, f"None 以外が返りました: {result}"
+        print("  -> PASS")
 
-        status = "OK" if result is None else "FAIL"
-        print(f"   {status}: 結果が None であること -> {result!r}")
-        if status == "FAIL":
-            errors.append("存在しないファイルの読込で None が返りませんでした。")
+        # ---------------------------------------------------------
+        # テスト 5: 異常系 (非辞書型データの保存拒絶)
+        # ---------------------------------------------------------
+        print("\n[TEST 5] 異常系: 非辞書型データの保存が拒絶されること")
+        # 意図: isinstance チェックが機能していることを確認する
+        result = save_data(["list", "not", "dict"], json_path, logger)  # type: ignore[arg-type]
+        assert result is False, f"非辞書型が受け入れられてしまいました: {result}"
+        print("  -> PASS")
 
+    except AssertionError as e:
+        print(f"\n[FAIL] アサーション失敗: {e}")
     except Exception as e:
-        errors.append(f"テスト中に予期せぬ例外が発生: {e}")
-        print(f"   ERROR: {e}")
+        print(f"\n[FAIL] 予期しないエラー: {e}")
+        import traceback
 
+        traceback.print_exc()
     finally:
-        # クリーンアップ
-        if test_dir.exists():
-            time.sleep(0.5)  # OSのファイルロック解放待ち
-            try:
-                shutil.rmtree(test_dir)
-                print(f"\n   CLEANUP: 一時ディレクトリを削除しました: {test_dir}")
-            except Exception as e:
-                print(f"\n   WARNING: クリーンアップに失敗しました: {e}")
+        # テストリソースのクリーンアップ
+        close_logger_handlers(TEST_LOGGER_NAME)
+        # Windows のファイルロック解放待ち
+        time.sleep(0.5)
+        for target_dir in [TEST_LOG_DIR, TEST_DATA_DIR]:
+            if Path(target_dir).exists():
+                try:
+                    shutil.rmtree(target_dir)
+                    print(f"\nCLEANUP: {target_dir} を削除しました。")
+                except Exception as e:
+                    print(f"\nCLEANUP WARNING: {target_dir} の削除に失敗: {e}")
 
-    # ---- サマリ ----
     print("\n" + "=" * 60)
-    if errors:
-        print(f"   FAILED — {len(errors)} error(s):")
-        for msg in errors:
-            print(f"      ✗ {msg}")
-    else:
-        print("   ALL TESTS PASSED")
-    print("=" * 60 + "\n")
+    print(" 全テスト完了")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

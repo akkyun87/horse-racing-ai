@@ -1,3 +1,5 @@
+# ファイルパス: src/utils/retry_requests.py
+
 """
 src/utils/retry_requests.py
 
@@ -11,12 +13,18 @@ src/utils/retry_requests.py
 【外部依存】
 - ネットワーク: 指定 URL (主に JBIS: jbis.or.jp 等) への HTTP リクエスト
 - 外部ライブラリ: requests
+- 内部モジュール:
+    src.utils.logger (setup_logger, close_logger_handlers)
 
 【Usage】
     from src.utils.retry_requests import fetch_html
-    import logging
+    from src.utils.logger import setup_logger
 
-    logger = logging.getLogger(__name__)
+    logger = setup_logger(
+        log_filepath="logs/retry_requests.log",
+        log_level="INFO",
+        logger_name="RetryRequests",
+    )
 
     response = fetch_html(
         url="https://www.jbis.or.jp/race/result/.../",
@@ -36,7 +44,9 @@ src/utils/retry_requests.py
 # ---------------------------------------------------------
 
 import logging
+import shutil
 import time
+from pathlib import Path
 from typing import Callable, Dict, Final, Optional
 
 import requests
@@ -123,6 +133,7 @@ def fetch_html(
               外部へ伝播しない。
 
     Example:
+        >>> logger = setup_logger("logs/retry_requests.log", logger_name="RetryRequests")
         >>> response = fetch_html("https://www.jbis.or.jp/race/result/.../", logger)
         >>> if response is None:
         ...     print("ネットワークエラー")
@@ -272,195 +283,219 @@ def fetch_html(
 
 
 def _run_tests() -> None:
-    """主要機能の動作確認テストを実行する。
-
-    正常系・4xx・5xx・バリデーションの各ケースを検証する。
-    外部ネットワーク (httpbin.org) を使用するため、
-    ネットワーク未接続環境ではオンラインテストが自動スキップされる。
     """
-    import sys
+    主要機能の動作確認テストを実行する。
 
-    # ---- ログ設定 ----
-    test_logger = logging.getLogger("test_retry_requests")
-    test_logger.setLevel(logging.DEBUG)
-    if not test_logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-        test_logger.addHandler(handler)
+    requests.Session および time.sleep を unittest.mock でモックすることで
+    外部ネットワークへの依存を排除し、単体実行を可能にする。
+    テスト終了後はログファイルとロガーをすべて解放・削除する。
+
+    Args:
+        なし。
+
+    Returns:
+        None: 戻り値なし。テスト結果は標準出力に print する。
+
+    Raises:
+        None: AssertionError および予期しない例外は内部でキャッチして出力する。
+
+    Example:
+        # python -m src.utils.retry_requests
+        _run_tests()
+    """
+    from unittest.mock import MagicMock, patch
+
+    from src.utils.logger import close_logger_handlers, setup_logger
+
+    TEST_LOG_DIR: Final[str] = "logs/_test_retry_requests_tmp"
+    TEST_LOG_FILE: Final[str] = f"{TEST_LOG_DIR}/test.log"
+    TEST_LOGGER_NAME: Final[str] = "test_retry_requests"
+
+    print("=" * 60)
+    print(" retry_requests.py 簡易単体テスト 開始")
+    print("=" * 60)
+
+    logger = setup_logger(
+        log_filepath=TEST_LOG_FILE,
+        log_level="DEBUG",
+        logger_name=TEST_LOGGER_NAME,
+    )
+
+    def _make_mock_session(status_code: int) -> MagicMock:
+        """
+        指定ステータスコードを返すモック Session を生成する。
+
+        requests.Session をコンテキストマネージャとして使用するため、
+        __enter__ / __exit__ を設定したうえで get の戻り値を差し替える。
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+
+        mock_instance = MagicMock()
+        mock_instance.get.return_value = mock_response
+        # 意図: `with requests.Session() as session` の session に mock_instance を束縛する
+        mock_instance.__enter__ = MagicMock(return_value=mock_instance)
+        mock_instance.__exit__ = MagicMock(return_value=False)
+        return mock_instance
+
+    try:
+        # ---------------------------------------------------------
+        # テスト 1: 異常系 (空 URL → None)
+        # ---------------------------------------------------------
+        print("\n[TEST 1] 異常系: 空 URL バリデーション")
+        for invalid_url in ["", "   "]:
+            result = fetch_html(invalid_url, logger)
+            assert (
+                result is None
+            ), f"空 URL {invalid_url!r} に対して None が返りませんでした: {result}"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 2: 異常系 (負の max_retries → 0 に補正されること)
+        # ---------------------------------------------------------
+        print("\n[TEST 2] 異常系: 負の max_retries を 0 に補正して例外なく動作すること")
+        mock_session = _make_mock_session(200)
+        with (
+            patch("src.utils.retry_requests.time.sleep"),
+            patch(
+                "src.utils.retry_requests.requests.Session",
+                return_value=mock_session,
+            ),
+        ):
+            result = fetch_html(
+                "https://www.jbis.or.jp/",
+                logger,
+                max_retries=-1,
+                request_interval=0.0,
+            )
+        assert result is not None, "負の max_retries 補正後にリクエストが失敗しました"
+        assert (
+            result.status_code == 200
+        ), f"ステータスコードが一致しません: {result.status_code}"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 3: 正常系 (200 OK → Response 返却)
+        # ---------------------------------------------------------
+        print("\n[TEST 3] 正常系: 200 OK レスポンスの返却")
+        mock_session = _make_mock_session(200)
+        with (
+            patch("src.utils.retry_requests.time.sleep"),
+            patch(
+                "src.utils.retry_requests.requests.Session",
+                return_value=mock_session,
+            ),
+        ):
+            result = fetch_html(
+                "https://www.jbis.or.jp/",
+                logger,
+                max_retries=1,
+                request_interval=0.0,
+            )
+        assert result is not None, "200 OK で None が返りました"
+        assert (
+            result.status_code == 200
+        ), f"ステータスコードが一致しません: {result.status_code}"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 4: 異常系 (4xx → 即時返却かつリトライなし)
+        # ---------------------------------------------------------
+        print("\n[TEST 4] 異常系: 4xx クライアントエラーの即時返却・リトライなし検証")
+        mock_session = _make_mock_session(404)
+        with (
+            patch("src.utils.retry_requests.time.sleep"),
+            patch(
+                "src.utils.retry_requests.requests.Session",
+                return_value=mock_session,
+            ),
+        ):
+            result = fetch_html(
+                "https://www.jbis.or.jp/",
+                logger,
+                max_retries=3,
+                request_interval=0.0,
+            )
+        assert result is not None, "404 で None が返りました"
+        assert (
+            result.status_code == 404
+        ), f"ステータスコードが一致しません: {result.status_code}"
+        # 意図: 4xx はリトライしないため session.get の呼び出しが 1 回のみであることを検証する
+        call_count = mock_session.get.call_count
+        assert (
+            call_count == 1
+        ), f"4xx でリトライが発生しました: {call_count} 回呼び出し (期待値: 1)"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 5: 異常系 (5xx → リトライ後に Response(500) 返却)
+        # ---------------------------------------------------------
+        print("\n[TEST 5] 異常系: 5xx サーバーエラーのリトライ後 Response(500) 返却")
+        mock_session = _make_mock_session(500)
+        with (
+            patch("src.utils.retry_requests.time.sleep"),
+            patch(
+                "src.utils.retry_requests.requests.Session",
+                return_value=mock_session,
+            ),
+        ):
+            result = fetch_html(
+                "https://www.jbis.or.jp/",
+                logger,
+                max_retries=2,
+                request_interval=0.0,
+                retry_interval=0.0,
+            )
+        assert result is not None, "5xx リトライ超過後に None が返りました"
+        assert (
+            result.status_code == 500
+        ), f"ステータスコードが一致しません: {result.status_code}"
+        # 意図: max_retries=2 の場合、初回 + 2回リトライ = 計 3 回呼び出されることを検証する
+        call_count = mock_session.get.call_count
+        assert (
+            call_count == 3
+        ), f"5xx のリトライ回数が一致しません: {call_count} 回呼び出し (期待値: 3)"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 6: 正常系 (定数の妥当性検証)
+        # ---------------------------------------------------------
+        print("\n[TEST 6] 正常系: 定数の妥当性検証")
+        assert (
+            DEFAULT_MAX_RETRIES > 0
+        ), f"DEFAULT_MAX_RETRIES が 0 以下です: {DEFAULT_MAX_RETRIES}"
+        assert (
+            HTTP_SERVER_ERROR_MIN == 500
+        ), "HTTP_SERVER_ERROR_MIN が 500 ではありません"
+        assert (
+            HTTP_SERVER_ERROR_MAX == 599
+        ), "HTTP_SERVER_ERROR_MAX が 599 ではありません"
+        assert (
+            HTTP_CLIENT_ERROR_MIN == 400
+        ), "HTTP_CLIENT_ERROR_MIN が 400 ではありません"
+        assert HTTP_FORBIDDEN == 403, "HTTP_FORBIDDEN が 403 ではありません"
+        assert (
+            "User-Agent" in DEFAULT_HEADERS
+        ), "DEFAULT_HEADERS に User-Agent がありません"
+        assert "Referer" in DEFAULT_HEADERS, "DEFAULT_HEADERS に Referer がありません"
+        print("  -> PASS")
+
+    except AssertionError as e:
+        print(f"\n[FAIL] アサーション失敗: {e}")
+    except Exception as e:
+        print(f"\n[FAIL] 予期しないエラー: {e}")
+        import traceback
+
+        traceback.print_exc()
+    finally:
+        close_logger_handlers(TEST_LOGGER_NAME)
+        if Path(TEST_LOG_DIR).exists():
+            shutil.rmtree(TEST_LOG_DIR)
+            print(f"\nCLEANUP: {TEST_LOG_DIR} を削除しました。")
 
     print("\n" + "=" * 60)
-    print("  Unit Test: src/utils/retry_requests.py")
-    print("=" * 60 + "\n")
-
-    errors: list[str] = []
-
-    # ---------------------------------------------------------
-    # [Test 1] 入力バリデーション: 空 URL → None を返すこと
-    # ---------------------------------------------------------
-    print("[Test 1] 空 URL バリデーション")
-    for invalid_url in ["", "   ", None]:
-        # None は型ヒント上 str だが、防御的に検証する
-        result = fetch_html(invalid_url or "", test_logger)  # type: ignore[arg-type]
-        status = "OK" if result is None else "FAIL"
-        print(f"  {status}: fetch_html({invalid_url!r}) -> None")
-        if status == "FAIL":
-            errors.append(f"空 URL {invalid_url!r} に対して None が返りませんでした。")
-
-    # ---------------------------------------------------------
-    # [Test 2] 入力バリデーション: 負の max_retries → 補正されること
-    # ---------------------------------------------------------
-    print("\n[Test 2] 負の max_retries 補正")
-    # 補正後は 0 になるため 1 回だけ試行される。
-    # ネットワーク不要なバリデーション部分のみ検証する
-    try:
-        # 補正は内部で行われ例外は送出されないことを確認する
-        fetch_html(
-            "https://httpbin.org/get",
-            test_logger,
-            max_retries=-1,
-            request_interval=0.0,
-            timeout=1.0,
-        )
-        print("  OK: 負の max_retries でも例外が送出されませんでした。")
-    except Exception as e:
-        errors.append(f"負の max_retries で予期せぬ例外: {e}")
-        print(f"  FAIL: {e}")
-
-    # ---------------------------------------------------------
-    # [Test 3] オンライン: 正常系 (200 OK)
-    # ---------------------------------------------------------
-    print("\n[Test 3] 正常系 (200 OK) — live network")
-    try:
-        res = fetch_html(
-            "https://httpbin.org/get",
-            test_logger,
-            max_retries=1,
-            request_interval=0.1,
-            timeout=5.0,
-        )
-        status = "OK" if (res and res.status_code == 200) else "FAIL"
-        code = res.status_code if res else "None"
-        print(f"  {status}: status_code={code} (expected: 200)")
-        if status == "FAIL":
-            errors.append(f"正常系: status_code={code}")
-    except Exception as e:
-        print(f"  SKIP: ネットワーク未接続のためスキップ: {e}")
-
-    # ---------------------------------------------------------
-    # [Test 4] オンライン: 4xx クライアントエラー → Response を即時返却
-    # ---------------------------------------------------------
-    print("\n[Test 4] 4xx クライアントエラーの即時返却 — live network")
-    try:
-        res = fetch_html(
-            "https://httpbin.org/status/404",
-            test_logger,
-            max_retries=1,
-            request_interval=0.1,
-            timeout=5.0,
-        )
-
-        # ===== レスポンスの確認 =====
-        if res is None:
-            code = "None"
-            status = "FAIL"
-            print(f"  DEBUG: res is None")
-        else:
-            # res が存在する場合、status_code を取得
-            code = res.status_code
-            print(f"  DEBUG: res is {type(res)}")
-            print(f"  DEBUG: res.status_code = {code!r} (type: {type(code).__name__})")
-
-            # ステータスコード判定
-            if isinstance(code, int):
-                is_correct_status = code == 404
-            else:
-                is_correct_status = str(code) == "404"
-
-            if is_correct_status:
-                status = "OK"
-            else:
-                status = "FAIL"
-
-        print(f"  {status}: status_code={code} (expected: 404, no retry)")
-        if status == "FAIL":
-            errors.append(f"4xx 即時返却: status_code={code}")
-    except Exception as e:
-        print(f"  SKIP: ネットワーク未接続のためスキップ: {e}")
-
-    # ---------------------------------------------------------
-    # [Test 5] オンライン: 5xx サーバーエラー → リトライ後 Response(500) を返却
-    # ---------------------------------------------------------
-    print("\n[Test 5] 5xx サーバーエラーのリトライ → Response(500) — live network")
-    try:
-        res = fetch_html(
-            "https://httpbin.org/status/500",
-            test_logger,
-            max_retries=2,
-            request_interval=0.1,
-            retry_interval=0.5,
-            timeout=5.0,
-        )
-
-        # ===== レスポンスの確認 =====
-        if res is None:
-            code = "None"
-            status = "FAIL"
-            print(f"  DEBUG: res is None")
-        else:
-            # res が存在する場合、status_code を取得
-            code = res.status_code
-            print(f"  DEBUG: res is {type(res)}")
-            print(f"  DEBUG: res.status_code = {code!r} (type: {type(code).__name__})")
-
-            # ステータスコード判定
-            if isinstance(code, int):
-                is_correct_status = code == 500
-            else:
-                is_correct_status = str(code) == "500"
-
-            if is_correct_status:
-                status = "OK"
-            else:
-                status = "FAIL"
-
-        print(
-            f"  {status}: status_code={code} (expected: 500, リトライ超過後のレスポンス)"
-        )
-        if status == "FAIL":
-            errors.append(f"5xx リトライ後: status_code={code}（500 であるべき）")
-    except Exception as e:
-        print(f"  SKIP: ネットワーク未接続のためスキップ: {e}")
-
-    # ---------------------------------------------------------
-    # [Test 6] 定数の妥当性チェック
-    # ---------------------------------------------------------
-    print("\n[Test 6] 定数の妥当性")
-    const_checks = [
-        ("DEFAULT_MAX_RETRIES > 0", DEFAULT_MAX_RETRIES > 0),
-        ("HTTP_SERVER_ERROR_MIN == 500", HTTP_SERVER_ERROR_MIN == 500),
-        ("HTTP_SERVER_ERROR_MAX == 599", HTTP_SERVER_ERROR_MAX == 599),
-        ("HTTP_CLIENT_ERROR_MIN == 400", HTTP_CLIENT_ERROR_MIN == 400),
-        ("HTTP_FORBIDDEN == 403", HTTP_FORBIDDEN == 403),
-        ("DEFAULT_HEADERS has User-Agent", "User-Agent" in DEFAULT_HEADERS),
-        ("DEFAULT_HEADERS has Referer", "Referer" in DEFAULT_HEADERS),
-    ]
-    for label, ok in const_checks:
-        status = "OK" if ok else "FAIL"
-        print(f"  {status}: {label}")
-        if not ok:
-            errors.append(f"定数チェック失敗: {label}")
-
-    # ---------------------------------------------------------
-    # テスト結果サマリ
-    # ---------------------------------------------------------
-    print("\n" + "=" * 60)
-    if errors:
-        print(f"  FAILED — {len(errors)} error(s):")
-        for msg in errors:
-            print(f"    ✗ {msg}")
-    else:
-        print("  ALL TESTS PASSED")
-    print("=" * 60 + "\n")
+    print(" 全テスト完了")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

@@ -12,14 +12,20 @@ PedigreeInfo (血統情報) および RaceDetail (レース詳細) の
 
 【外部依存】
 - 内部モデル: src.data_pipeline.data_models (PedigreeInfo, RaceDetail)
+- 内部モジュール:
+    src.utils.logger (setup_logger, close_logger_handlers)
 
 【Usage】
     from src.data_pipeline.data_validator import validate_pedigree_info
     from src.data_pipeline.data_validator import validate_race_detail
     from src.data_pipeline.data_validator import validate_dataset
-    import logging
+    from src.utils.logger import setup_logger
 
-    logger = logging.getLogger(__name__)
+    logger = setup_logger(
+        log_filepath="logs/data_validator.log",
+        log_level="INFO",
+        logger_name="DataValidator",
+    )
 
     ok, errors = validate_pedigree_info(pedigree, logger)
     if not ok:
@@ -31,6 +37,8 @@ PedigreeInfo (血統情報) および RaceDetail (レース詳細) の
 # ---------------------------------------------------------
 
 import logging
+import shutil
+from pathlib import Path
 from typing import Dict, Final, List, Sequence, Tuple, Union
 
 from src.data_pipeline.data_models import PedigreeInfo, RaceDetail
@@ -67,7 +75,7 @@ def _check_type(
         errors (List[str]): 検証エラーを追記するリスト (破壊的変更あり)。
 
     Returns:
-        None
+        None: 戻り値なし（副作用として errors リストを更新する）。
 
     Raises:
         None: 本関数は例外を外部へ伝播しない。
@@ -105,7 +113,7 @@ def _check_list_length(
                            デフォルトは False。
 
     Returns:
-        None
+        None: 戻り値なし（副作用として errors リストを更新する）。
 
     Raises:
         None: 本関数は例外を外部へ伝播しない。
@@ -148,7 +156,7 @@ def _check_pair_length(
         errors (List[str]): 検証エラーを追記するリスト (破壊的変更あり)。
 
     Returns:
-        None
+        None: 戻り値なし（副作用として errors リストを更新する）。
 
     Raises:
         None: 本関数は例外を外部へ伝播しない。
@@ -181,7 +189,7 @@ def validate_pedigree_info(
     PedigreeInfo の構造的・論理的整合性を検証する。
 
     検証項目:
-        - horse_id の型 (int)
+        - horse_id の型 (str)
         - name の型 (str) および空文字チェック
         - five_gen_ancestor_names と five_gen_ancestor_ids の要素数一致
         - five_gen_sire_names と five_gen_sire_ids の要素数一致
@@ -202,6 +210,7 @@ def validate_pedigree_info(
         None: 本関数は例外を外部へ伝播しない。
 
     Example:
+        >>> logger = setup_logger("logs/validator.log", logger_name="Validator")
         >>> ok, errors = validate_pedigree_info(pedigree, logger)
         >>> if not ok:
         ...     print(errors)
@@ -212,8 +221,8 @@ def validate_pedigree_info(
     # 基本フィールドの型チェック
     # ---------------------------------------------------------
 
-    # horse_id は整数型でなければ DB キーとして使用できない
-    _check_type(pedigree.horse_id, int, "horse_id", errors)
+    # horse_id は文字列型でなければ DB キーとして使用できない
+    _check_type(pedigree.horse_id, str, "horse_id", errors)
 
     # name は文字列型かつ空文字でないことを確認する
     _check_type(pedigree.name, str, "name", errors)
@@ -312,6 +321,7 @@ def validate_race_detail(
         None: 本関数は例外を外部へ伝播しない。
 
     Example:
+        >>> logger = setup_logger("logs/validator.log", logger_name="Validator")
         >>> ok, errors = validate_race_detail(race_detail, logger)
     """
     errors: List[str] = []
@@ -321,7 +331,6 @@ def validate_race_detail(
     # ---------------------------------------------------------
 
     # date は ISO 8601 形式 (YYYY-MM-DD) の文字列型であることを確認する
-    # (ここでは簡略化していますが、実際の各フィールドチェックが入ります)
     _check_type(race_detail.date, str, "date", errors)
 
     # ---------------------------------------------------------
@@ -362,6 +371,7 @@ def validate_dataset(
         None: 本関数は例外を外部へ伝播しない。
 
     Example:
+        >>> logger = setup_logger("logs/validator.log", logger_name="Validator")
         >>> results = validate_dataset([pedigree, race], logger)
         >>> for key, errs in results.items():
         ...     print(key, errs)
@@ -401,155 +411,165 @@ def validate_dataset(
 
 
 def _run_tests() -> None:
-    """主要機能の動作確認テストを実行する。
-
-    正常系・異常系・混合データセットの3軸で検証する。
-    外部依存はデータモデルの構築のみであり、ネットワーク・DB は不要。
     """
-    import sys
+    主要機能の動作確認テストを実行する。
 
-    # ---- ログ設定 ----
-    test_logger = logging.getLogger("test_data_validator")
-    test_logger.setLevel(logging.DEBUG)
-    if not test_logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-        test_logger.addHandler(handler)
+    外部依存（DB・ネットワーク）を持たず、データモデルのインスタンス構築のみを使用するため
+    単体実行が可能。テスト終了後はログファイルとロガーをすべて解放・削除する。
+
+    Args:
+        なし。
+
+    Returns:
+        None: 戻り値なし。テスト結果は標準出力に print する。
+
+    Raises:
+        None: AssertionError および予期しない例外は内部でキャッチして出力する。
+
+    Example:
+        # python -m src.data_pipeline.data_validator
+        _run_tests()
+    """
+    from src.utils.logger import close_logger_handlers, setup_logger
+
+    TEST_LOG_DIR: Final[str] = "logs/_test_data_validator_tmp"
+    TEST_LOG_FILE: Final[str] = f"{TEST_LOG_DIR}/test.log"
+    TEST_LOGGER_NAME: Final[str] = "test_data_validator"
+
+    print("=" * 60)
+    print(" data_validator.py 簡易単体テスト 開始")
+    print("=" * 60)
+
+    logger = setup_logger(
+        log_filepath=TEST_LOG_FILE,
+        log_level="DEBUG",
+        logger_name=TEST_LOGGER_NAME,
+    )
+
+    try:
+        # ---------------------------------------------------------
+        # テスト 1: _check_type (正常系・異常系)
+        # ---------------------------------------------------------
+        print("\n[TEST 1] 正常系/異常系: _check_type の型チェック")
+        type_cases = [
+            (123, int, "horse_id", False),  # 正常: int に int
+            ("abc", int, "horse_id", True),  # 異常: int に str
+            ("hi", str, "name", False),  # 正常: str に str
+            (3.14, str, "name", True),  # 異常: str に float
+        ]
+        for value, typ, field, expect_error in type_cases:
+            errs: List[str] = []
+            _check_type(value, typ, field, errs)
+            has_error = len(errs) > 0
+            assert has_error == expect_error, (
+                f"_check_type({value!r}, {typ.__name__}): "
+                f"エラー発生={has_error} (期待値: {expect_error})"
+            )
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 2: _check_list_length (正常系・異常系・allow_zero)
+        # ---------------------------------------------------------
+        print("\n[TEST 2] 正常系/異常系: _check_list_length の要素数チェック")
+        len_cases = [
+            (["a"] * 62, 62, False, False),  # 正常: 62件
+            (["a"] * 10, 62, False, True),  # 異常: 10件
+            ([], 62, True, False),  # 正常: 空 + allow_zero=True
+            ([], 62, False, True),  # 異常: 空 + allow_zero=False
+        ]
+        for lst, exp, allow_zero, expect_error in len_cases:
+            errs_l: List[str] = []
+            _check_list_length(lst, exp, "field", errs_l, allow_zero=allow_zero)
+            has_error = len(errs_l) > 0
+            assert has_error == expect_error, (
+                f"_check_list_length(len={len(lst)}, exp={exp}, allow_zero={allow_zero}): "
+                f"エラー発生={has_error} (期待値: {expect_error})"
+            )
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 3: validate_pedigree_info (正常系)
+        # ---------------------------------------------------------
+        print("\n[TEST 3] 正常系: validate_pedigree_info の合格ケース")
+        # 意図: horse_id は str 型でなければ _check_type(str) を通過しないため
+        #       str 形式の ID を渡す
+        valid_pedigree = PedigreeInfo(
+            horse_id="0001234500",
+            name="テスト馬",
+            five_gen_ancestor_names=["祖先"] * EXPECTED_ANCESTOR_COUNT,
+            five_gen_ancestor_ids=[0] * EXPECTED_ANCESTOR_COUNT,
+            five_gen_sire_names=["種牡馬"] * EXPECTED_SIRE_COUNT,
+            five_gen_sire_ids=[0] * EXPECTED_SIRE_COUNT,
+            five_gen_sire_lineage_names=None,
+            five_gen_sire_lineage_ids=None,
+        )
+        ok, errs_v = validate_pedigree_info(valid_pedigree, logger)
+        assert ok is True, f"正常系で ok=False が返りました: {errs_v}"
+        assert errs_v == [], f"正常系でエラーが返りました: {errs_v}"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 4: validate_pedigree_info (異常系・複数エラー)
+        # ---------------------------------------------------------
+        print("\n[TEST 4] 異常系: validate_pedigree_info の複数エラー検出")
+        invalid_pedigree = PedigreeInfo(
+            horse_id="INVALID",  # str 型なので型チェックは通過する
+            name="",  # 意図: 空文字エラーを発生させる
+            five_gen_ancestor_names=["祖先"] * 10,
+            five_gen_ancestor_ids=[0] * 20,  # 意図: ペア不一致エラーを発生させる
+            five_gen_sire_names=[],
+            five_gen_sire_ids=[],
+            five_gen_sire_lineage_names=None,
+            five_gen_sire_lineage_ids=None,
+        )
+        ok, errs_i = validate_pedigree_info(invalid_pedigree, logger)
+        assert ok is False, f"異常系で ok=True が返りました"
+        assert len(errs_i) > 0, "異常系でエラーリストが空です"
+
+        # 意図: horse_id は str 型なので型エラーは出ない。
+        #       発生するエラーは name(空文字) と five_gen_ancestor(ペア不一致・件数不一致)
+        expected_error_fields = ["name", "five_gen_ancestor"]
+        for field in expected_error_fields:
+            assert any(
+                field in e for e in errs_i
+            ), f"'{field}' に関するエラーがエラーリストに含まれていません: {errs_i}"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 5: validate_dataset (混合データセット)
+        # ---------------------------------------------------------
+        print("\n[TEST 5] 正常系/異常系: validate_dataset の混合データセット処理")
+        mixed_dataset = [valid_pedigree, invalid_pedigree, "未知の型（文字列）"]
+        results = validate_dataset(mixed_dataset, logger)  # type: ignore[arg-type]
+
+        unknown_keys = [k for k in results if k.startswith("Unknown:")]
+        pedigree_keys = [k for k in results if k.startswith("Pedigree:")]
+
+        assert len(results) == 3, f"結果件数が一致しません: {len(results)} (期待値: 3)"
+        assert (
+            len(unknown_keys) == 1
+        ), f"Unknown キー数が一致しません: {len(unknown_keys)} (期待値: 1)"
+        assert (
+            len(pedigree_keys) == 2
+        ), f"Pedigree キー数が一致しません: {len(pedigree_keys)} (期待値: 2)"
+        print("  -> PASS")
+
+    except AssertionError as e:
+        print(f"\n[FAIL] アサーション失敗: {e}")
+    except Exception as e:
+        print(f"\n[FAIL] 予期しないエラー: {e}")
+        import traceback
+
+        traceback.print_exc()
+    finally:
+        close_logger_handlers(TEST_LOGGER_NAME)
+        if Path(TEST_LOG_DIR).exists():
+            shutil.rmtree(TEST_LOG_DIR)
+            print(f"\nCLEANUP: {TEST_LOG_DIR} を削除しました。")
 
     print("\n" + "=" * 60)
-    print("  Unit Test: src/data_pipeline/data_validator.py")
-    print("=" * 60 + "\n")
-
-    errors: list[str] = []
-
-    # ---------------------------------------------------------
-    # [Test 1] _check_type: 正常系・異常系
-    # ---------------------------------------------------------
-    print("[Test 1] _check_type")
-    type_cases: list[tuple] = [
-        (123, int, "horse_id", False),  # 正常: int に int
-        ("abc", int, "horse_id", True),  # 異常: int に str
-        ("hello", str, "name", False),  # 正常: str に str
-        (3.14, str, "name", True),  # 異常: str に float
-    ]
-    for value, typ, field, expect_error in type_cases:
-        errs: list[str] = []
-        _check_type(value, typ, field, errs)
-        has_error = len(errs) > 0
-        status = "OK" if has_error == expect_error else "FAIL"
-        print(
-            f"  {status}: _check_type({value!r}, {typ.__name__}) -> error={has_error}"
-        )
-        if status == "FAIL":
-            errors.append(
-                f"_check_type({value!r}, {typ.__name__}): expected error={expect_error}"
-            )
-
-    # ---------------------------------------------------------
-    # [Test 2] _check_list_length: 正常系・異常系・allow_zero
-    # ---------------------------------------------------------
-    print("\n[Test 2] _check_list_length")
-    len_cases: list[tuple] = [
-        (["a"] * 62, 62, False, False),  # 正常: 62件
-        (["a"] * 10, 62, False, True),  # 異常: 10件
-        ([], 62, True, False),  # 正常: 空 + allow_zero=True
-        ([], 62, False, True),  # 異常: 空 + allow_zero=False
-    ]
-    for lst, exp, allow_zero, expect_error in len_cases:
-        errs_l: list[str] = []
-        _check_list_length(lst, exp, "field", errs_l, allow_zero=allow_zero)
-        has_error = len(errs_l) > 0
-        status = "OK" if has_error == expect_error else "FAIL"
-        print(
-            f"  {status}: len={len(lst)}, expected={exp}, "
-            f"allow_zero={allow_zero} -> error={has_error}"
-        )
-        if status == "FAIL":
-            errors.append(
-                f"_check_list_length(len={len(lst)}, exp={exp}, allow_zero={allow_zero})"
-            )
-
-    # ---------------------------------------------------------
-    # [Test 3] validate_pedigree_info: 正常系
-    # ---------------------------------------------------------
-    print("\n[Test 3] validate_pedigree_info — 正常系")
-    valid_pedigree = PedigreeInfo(
-        horse_id=12345,
-        name="テスト馬",
-        five_gen_ancestor_names=["祖先"] * EXPECTED_ANCESTOR_COUNT,
-        five_gen_ancestor_ids=[0] * EXPECTED_ANCESTOR_COUNT,
-        five_gen_sire_names=["種牡馬"] * EXPECTED_SIRE_COUNT,
-        five_gen_sire_ids=[0] * EXPECTED_SIRE_COUNT,
-        five_gen_sire_lineage_names=None,
-        five_gen_sire_lineage_ids=None,
-    )
-    ok, errs_v = validate_pedigree_info(valid_pedigree, test_logger)
-    status = "OK" if (ok is True and errs_v == []) else "FAIL"
-    print(f"  {status}: ok={ok}, errors={errs_v}")
-    if status == "FAIL":
-        errors.append(f"validate_pedigree_info 正常系: ok={ok}, errors={errs_v}")
-
-    # ---------------------------------------------------------
-    # [Test 4] validate_pedigree_info: 異常系 (複数エラー)
-    # ---------------------------------------------------------
-    print("\n[Test 4] validate_pedigree_info — 異常系")
-    invalid_pedigree = PedigreeInfo(
-        horse_id="INVALID",  # type: ignore[arg-type]
-        name="",
-        five_gen_ancestor_names=["祖先"] * 10,
-        five_gen_ancestor_ids=[0] * 20,  # ペア不一致
-        five_gen_sire_names=[],
-        five_gen_sire_ids=[],
-        five_gen_sire_lineage_names=None,
-        five_gen_sire_lineage_ids=None,
-    )
-    ok, errs_i = validate_pedigree_info(invalid_pedigree, test_logger)
-    status = "OK" if (ok is False and len(errs_i) > 0) else "FAIL"
-    print(f"  {status}: ok={ok}, error_count={len(errs_i)}")
-    if status == "FAIL":
-        errors.append(f"validate_pedigree_info 異常系: ok={ok}, errors={errs_i}")
-
-    # 具体的なエラー内容の検証
-    expected_error_fields = ["horse_id", "name", "five_gen_ancestor"]
-    for field in expected_error_fields:
-        found = any(field in e for e in errs_i)
-        status = "OK" if found else "FAIL"
-        print(f"  {status}: '{field}' に関するエラーが含まれること")
-        if status == "FAIL":
-            errors.append(f"'{field}' のエラーが errs_i に見つかりません: {errs_i}")
-
-    # ---------------------------------------------------------
-    # [Test 5] validate_dataset: 混合データセット
-    # ---------------------------------------------------------
-    print("\n[Test 5] validate_dataset — 混合データセット")
-    mixed_dataset = [valid_pedigree, invalid_pedigree, "未知の型（文字列）"]
-    results = validate_dataset(mixed_dataset, test_logger)  # type: ignore[arg-type]
-
-    unknown_keys = [k for k in results if k.startswith("Unknown:")]
-    pedigree_keys = [k for k in results if k.startswith("Pedigree:")]
-
-    checks = [
-        ("結果件数 == 3", len(results) == 3),
-        ("Unknown キー == 1", len(unknown_keys) == 1),
-        ("Pedigree キー == 2", len(pedigree_keys) == 2),
-    ]
-    for label, ok_check in checks:
-        status = "OK" if ok_check else "FAIL"
-        print(f"  {status}: {label}")
-        if not ok_check:
-            errors.append(f"validate_dataset: {label} が満たされていません。")
-
-    # ---------------------------------------------------------
-    # テスト結果サマリ
-    # ---------------------------------------------------------
-    print("\n" + "=" * 60)
-    if errors:
-        print(f"  FAILED — {len(errors)} error(s):")
-        for msg in errors:
-            print(f"    ✗ {msg}")
-    else:
-        print("  ALL TESTS PASSED")
-    print("=" * 60 + "\n")
+    print(" 全テスト完了")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ C:.
 |       
 +---agent
 |   |   instructions.md
-|   |   memorymd
+|   |   memory.md
 |   |   progress.md
 |   |   project_context.md
 |   |   
@@ -35,24 +35,62 @@ C:.
 |   |   |           
 |   |   +---stats
 |   |   \---urls
-|   \---data_pipeline
-|       |   data_loader.py
-|       |   data_models.py
-|       |   data_validator.py
-|       |   pedigree_scraper.py
-|       |   race_detail_scraper.py
-|       |   race_list_scraper.py
-|       |   
-|       \---__pycache__
-|               data_loader.cpython-312.pyc
-|               data_models.cpython-312.pyc
-|               data_validator.cpython-312.pyc
-|               pedigree_lineage_parser.cpython-312.pyc
-|               pedigree_lineage_scraper.cpython-312.pyc
-|               pedigree_scraper.cpython-312.pyc
-|               race_detail_scraper.cpython-312.pyc
-|               race_list_scraper.cpython-312.pyc
-|               
+|   +---data_pipeline
+|   |   |   data_loader.py
+|   |   |   data_models.py
+|   |   |   data_validator.py
+|   |   |   pedigree_scraper.py
+|   |   |   race_detail_scraper.py
+|   |   |   race_list_scraper.py
+|   |   |   
+|   |   \---__pycache__
+|   |           data_loader.cpython-312.pyc
+|   |           data_models.cpython-312.pyc
+|   |           data_validator.cpython-312.pyc
+|   |           pedigree_lineage_parser.cpython-312.pyc
+|   |           pedigree_lineage_scraper.cpython-312.pyc
+|   |           pedigree_scraper.cpython-312.pyc
+|   |           race_detail_scraper.cpython-312.pyc
+|   |           race_list_scraper.cpython-312.pyc
+|   |           
+|   \---old
+|       \---20251227_data_pipeline_src
+|           +---data_pipeline
+|           |   |   data_loader.py
+|           |   |   data_models.py
+|           |   |   data_validator.py
+|           |   |   pedigree_lineage_scraper.py
+|           |   |   pedigree_scraper.py
+|           |   |   race_detail_scraper.py
+|           |   |   race_list_scraper.py
+|           |   |   
+|           |   \---__pycache__
+|           |           data_loader.cpython-312.pyc
+|           |           data_models.cpython-312.pyc
+|           |           data_validator.cpython-312.pyc
+|           |           pedigree_lineage_parser.cpython-312.pyc
+|           |           pedigree_lineage_scraper.cpython-312.pyc
+|           |           pedigree_scraper.cpython-312.pyc
+|           |           race_detail_scraper.cpython-312.pyc
+|           |           race_list_scraper.cpython-312.pyc
+|           |           
+|           +---data_processing
+|           |       get_lineage.py
+|           |       
+|           +---model
+|           +---training
+|           \---utils
+|               |   db_manager.py
+|               |   file_manager.py
+|               |   logger.py
+|               |   retry_requests.py
+|               |   
+|               \---__pycache__
+|                       db_manager.cpython-312.pyc
+|                       file_manager.cpython-312.pyc
+|                       logger.cpython-312.pyc
+|                       retry_requests.cpython-312.pyc
+|                       
 +---config
 |       data_loader_config.yaml
 |       lineage.yaml
@@ -104,44 +142,6 @@ C:.
 |               
 +---logs
 +---models
-+---old
-|   \---20251227_data_pipeline_src
-|       +---data_pipeline
-|       |   |   data_loader.py
-|       |   |   data_models.py
-|       |   |   data_validator.py
-|       |   |   pedigree_lineage_scraper.py
-|       |   |   pedigree_scraper.py
-|       |   |   race_detail_scraper.py
-|       |   |   race_list_scraper.py
-|       |   |   
-|       |   \---__pycache__
-|       |           data_loader.cpython-312.pyc
-|       |           data_models.cpython-312.pyc
-|       |           data_validator.cpython-312.pyc
-|       |           pedigree_lineage_parser.cpython-312.pyc
-|       |           pedigree_lineage_scraper.cpython-312.pyc
-|       |           pedigree_scraper.cpython-312.pyc
-|       |           race_detail_scraper.cpython-312.pyc
-|       |           race_list_scraper.cpython-312.pyc
-|       |           
-|       +---data_processing
-|       |       get_lineage.py
-|       |       
-|       +---model
-|       +---training
-|       \---utils
-|           |   db_manager.py
-|           |   file_manager.py
-|           |   logger.py
-|           |   retry_requests.py
-|           |   
-|           \---__pycache__
-|                   db_manager.cpython-312.pyc
-|                   file_manager.cpython-312.pyc
-|                   logger.cpython-312.pyc
-|                   retry_requests.cpython-312.pyc
-|                   
 +---results
 +---scripts
 +---src

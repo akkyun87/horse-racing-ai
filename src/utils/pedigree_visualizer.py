@@ -1,97 +1,248 @@
-import os
-import sqlite3
+"""
+src/utils/pedigree_visualizer.py
+
+【概要】
+競走馬の5代血統表をHTMLおよび画像として出力するユーティリティ.
+DBから血統データを取得し、正確なインデックス・ラベル対応で血統表をHTMLツリー構造として出力する.
+画像変換には wkhtmltoimage を利用する.
+
+【外部依存】
+- DB: SQLite (src/utils/db_manager.py 経由)
+- ログ: src/utils/logger.py
+- 画像変換: wkhtmltoimage
+
+【Usage】
+    from src.utils.pedigree_visualizer import generate_pedigree_image
+    import logging
+
+    logger = logging.getLogger("example")
+    generate_pedigree_image(horse_id="0001352760", logger=logger)
+"""
+
+# ---------------------------------------------------------
+# インポート
+# ---------------------------------------------------------
+
+import logging
 import subprocess
+from pathlib import Path
+from typing import Dict, Optional
 
-# --- 設定エリア ---
-DB_PATH = os.path.join("data", "raw", "pedigree", "pedigree.db")
-HTML_DIR = os.path.join("images", "pedigree", "html")
-IMG_DIR = os.path.join("images", "pedigree", "img")
-# wkhtmltoimageのパス（環境に合わせて適宜修正してください）
-WKHTMLTOIMAGE = r"C:\Program Files\wkhtmltopdf\bin\wkhtmltoimage.exe"
+from src.utils import db_manager
+from src.utils.logger import setup_logger
+
+# ---------------------------------------------------------
+# 定数・設定
+# ---------------------------------------------------------
+
+# 保存先ディレクトリおよび外部ツールのパス
+DB_PATH: Path = Path("data/raw/pedigree/pedigree.db")
+HTML_DIR: Path = Path("images/pedigree/html")
+IMG_DIR: Path = Path("images/pedigree/img")
+WKHTMLTOIMAGE: str = r"C:\Program Files\wkhtmltopdf\bin\wkhtmltoimage.exe"
+
+# ---------------------------------------------------------
+# 5代血統表インデックス → ラベル対応dict
+# ---------------------------------------------------------
+
+PEDIGREE_INDEX_LABELS: Dict[int, str] = {
+    # 父系（0〜30）
+    0: "父",
+    1: "父父",
+    2: "父母",
+    3: "父父父",
+    4: "父父母",
+    5: "父母父",
+    6: "父母母",
+    7: "父父父父",
+    8: "父父父母",
+    9: "父父母父",
+    10: "父父母母",
+    11: "父母父父",
+    12: "父母父母",
+    13: "父母母父",
+    14: "父母母母",
+    15: "父父父父父",
+    16: "父父父父母",
+    17: "父父父母父",
+    18: "父父父母母",
+    19: "父父母父父",
+    20: "父父母父母",
+    21: "父父母母父",
+    22: "父父母母母",
+    23: "父母父父父",
+    24: "父母父父母",
+    25: "父母父母父",
+    26: "父母父母母",
+    27: "父母母父父",
+    28: "父母母父母",
+    29: "父母母母父",
+    30: "父母母母母",
+    # 母系（31〜61）
+    31: "母",
+    32: "母父",
+    33: "母母",
+    34: "母父父",
+    35: "母父母",
+    36: "母母父",
+    37: "母母母",
+    38: "母父父父",
+    39: "母父父母",
+    40: "母父母父",
+    41: "母父母母",
+    42: "母母父父",
+    43: "母母父母",
+    44: "母母母父",
+    45: "母母母母",
+    46: "母父父父父",
+    47: "母父父父母",
+    48: "母父父母父",
+    49: "母父父母母",
+    50: "母父母父父",
+    51: "母父母父母",
+    52: "母父母母父",
+    53: "母父母母母",
+    54: "母母父父父",
+    55: "母母父父母",
+    56: "母母父母父",
+    57: "母母父母母",
+    58: "母母母父父",
+    59: "母母母父母",
+    60: "母母母母父",
+    61: "母母母母母",
+}
 
 
-def get_pedigree_data(horse_id):
+# ---------------------------------------------------------
+# 血統データ取得
+# ---------------------------------------------------------
+
+
+def get_pedigree_data(horse_id: str, logger: logging.Logger) -> Optional[dict]:
     """
-    DBから血統データを取得し、[父系31頭, 母系31頭] の構造を
-    家系図の[a0〜a61]インデックスに正しくマッピングする
+    指定馬IDの pedigree_info テーブルのレコード全体を返す.
+
+    Args:
+        horse_id (str): 馬ID（数値/文字列どちらも可）.
+        logger (logging.Logger): ロガー.
+
+    Returns:
+        Optional[dict]: レコード全体. 見つからない場合は None.
+
+    Raises:
+        例外は握りつぶさず logger で出力し、失敗時は None を返す.
+
+    Example:
+        row = get_pedigree_data("0001352760", logger)
     """
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
 
-    # IDを0埋め10桁の文字列に揃える
-    target_id = str(horse_id).zfill(10)
+    # ---------------------------------------------------------
+    # horse_id を10桁0埋めに統一する
+    # ---------------------------------------------------------
 
-    cur.execute(
-        "SELECT name, five_gen_ancestors FROM pedigree_info WHERE horse_id=?",
-        (target_id,),
-    )
-    row = cur.fetchone()
-    conn.close()
+    try:
+        target_id = str(horse_id).zfill(10)
+        records = db_manager.load_from_db(str(DB_PATH), "pedigree_info", logger)
+
+        if not records:
+            logger.error("pedigree_info テーブルが空、またはDBアクセス失敗")
+            return None
+
+        # 対象IDと一致するレコードを線形探索する
+        row = next(
+            (r for r in records if str(r.get("horse_id")).zfill(10) == target_id),
+            None,
+        )
+
+    except Exception as e:
+        logger.error(f"DBアクセスエラー : {e}")
+        return None
 
     if not row:
-        print(f"Error: horse_id {target_id} not found.")
-        return None, None
+        logger.error(f"horse_id {target_id} が見つかりません.")
+        return None
 
-    name = row[0]
-    # 全62頭（または63頭）のリストを取得
-    raw_list = [x.strip() for x in row[1].split(",") if x.strip()]
-
-    # 先頭に対象馬自身が含まれている場合は除去して62頭にする
-    if len(raw_list) == 63:
-        raw_list = raw_list[1:]
-
-    if len(raw_list) < 62:
-        print(f"Warning: Data insufficient for {name} (Count: {len(raw_list)})")
-        while len(raw_list) < 62:
-            raw_list.append("")
-
-    # --- インデックス再マッピング ---
-    # raw_list[0:31] = 父系 (1代x1, 2代x2, 3代x4, 4代x8, 5代x16)
-    # raw_list[31:62] = 母系 (1代x1, 2代x2, 3代x4, 4代x8, 5代x16)
-
-    p_sire = raw_list[0:31]
-    p_dam = raw_list[31:62]
-
-    # 出力用の配列 a (0〜61) を作成
-    # a[0]=父, a[1]=母, a[2]=父父, a[3]=父母, a[4]=母父, a[5]=母母 ... の順
-    a = [None] * 62
-
-    # 1代前 (1頭ずつ)
-    a[0], a[1] = p_sire[0], p_dam[0]
-    # 2代前 (2頭ずつ)
-    a[2:4], a[4:6] = p_sire[1:3], p_dam[1:3]
-    # 3代前 (4頭ずつ)
-    a[6:10], a[10:14] = p_sire[3:7], p_dam[3:7]
-    # 4代前 (8頭ずつ)
-    a[14:22], a[22:30] = p_sire[7:15], p_dam[7:15]
-    # 5代前 (16頭ずつ)
-    a[30:46], a[46:62] = p_sire[15:31], p_dam[15:31]
-
-    return name, a
+    return row
 
 
-def build_html(name, a):
-    """HTMLテーブル構造の組み立て (rowspanロジック)"""
-    html_body = f"""
+# ---------------------------------------------------------
+# HTML構築ユーティリティ
+# ---------------------------------------------------------
+
+
+def get_cell_html(
+    idx: int,
+    pedigree_dict: Dict[int, str],
+    record: Optional[dict],
+) -> str:
+    """
+    指定インデックスのセル内容（馬名＋系統情報）を返す.
+
+    種牡馬（ラベルが「父」で終わる）の場合のみ系統情報を付与する.
+
+    Args:
+        idx (int): 血統インデックス.
+        pedigree_dict (Dict[int, str]): インデックス → 馬名 dict.
+        record (Optional[dict]): DBレコード全体（系統情報付与用）.
+
+    Returns:
+        str: セル表示用HTML文字列.
+
+    Example:
+        html = get_cell_html(0, pedigree_dict, record)
+    """
+
+    name = pedigree_dict.get(idx, "")
+    label = PEDIGREE_INDEX_LABELS.get(idx, "")
+
+    # 種牡馬セルにのみ系統情報をサブテキストとして付与する
+    if record and label.endswith("父"):
+        lineage = record.get(f"lineage_name_{label}", "")
+        if lineage:
+            return (
+                f"{name}<br>"
+                f"<span style='font-size:10px;color:#666'>{lineage}</span>"
+            )
+
+    return name
+
+
+def build_html(
+    name: str,
+    pedigree_dict: Dict[int, str],
+    record: Optional[dict],
+) -> str:
+    """
+    血統表HTMLテーブルを組み立てる.
+
+    Args:
+        name (str): 馬名.
+        pedigree_dict (Dict[int, str]): インデックス → 馬名 dict.
+        record (Optional[dict]): DBレコード全体（系統情報付与用）.
+
+    Returns:
+        str: HTML文字列.
+
+    Example:
+        html = build_html("キタサンブラック", pedigree_dict, record)
+    """
+
+    # ---------------------------------------------------------
+    # CSSスタイル定義
+    # ---------------------------------------------------------
+
+    html_content = f"""
 <html>
 <head>
     <meta charset="utf-8">
     <style>
-        body {{ font-family: "MS Gothic", "Meiryo", Arial, sans-serif; margin: 10px; }}
+        body {{ font-family: 'MS Gothic', 'Meiryo', Arial, sans-serif; margin: 10px; }}
         h2 {{ font-size: 18px; color: #333; border-bottom: 2px solid #333; display: inline-block; }}
-        table {{ border-collapse: collapse; border: 2px solid #000; table-layout: fixed; width: 1100px; }}
-        td {{ 
-            border: 1px solid #444; 
-            height: 26px; 
-            padding: 2px 5px; 
-            font-size: 11px; 
-            overflow: hidden;
-            white-space: nowrap;
-            text-overflow: ellipsis;
-        }}
-        .target {{ background: #eee; font-weight: bold; text-align: center; width: 120px; }}
-        .sire-side {{ background: #f0faff; }} /* 父系カラー */
-        .dam-side {{ background: #fff5f7; }}  /* 母系カラー */
+        table {{ border-collapse: collapse; border: 2px solid #000; table-layout: fixed; width: 1000px; }}
+        td {{ border: 1px solid #444; height: 26px; padding: 2px 5px; font-size: 12px; text-align: center; }}
+        .target {{ background: #eee; font-weight: bold; }}
+        .sire-side {{ background: #f0faff; }}
+        .dam-side {{ background: #fff5f7; }}
     </style>
 </head>
 <body>
@@ -99,78 +250,142 @@ def build_html(name, a):
     <table>
         <tr>
             <td class="target" rowspan="32">{name}</td>
-            <td class="sire-side" rowspan="16">{a[0]}</td>
-            <td rowspan="8">{a[2]}</td>
-            <td rowspan="4">{a[6]}</td>
-            <td rowspan="2">{a[14]}</td>
-            <td>{a[30]}</td>
+            <td class="sire-side" rowspan="16">{get_cell_html(0, pedigree_dict, record)}</td>
+            <td rowspan="8">{get_cell_html(1, pedigree_dict, record)}</td>
+            <td rowspan="4">{get_cell_html(3, pedigree_dict, record)}</td>
+            <td rowspan="2">{get_cell_html(7, pedigree_dict, record)}</td>
+            <td>{get_cell_html(15, pedigree_dict, record)}</td>
         </tr>
-        <tr><td>{a[31]}</td></tr>
-        <tr><td rowspan="2">{a[15]}</td><td>{a[32]}</td></tr>
-        <tr><td>{a[33]}</td></tr>
-        <tr><td rowspan="4">{a[7]}</td><td rowspan="2">{a[16]}</td><td>{a[34]}</td></tr>
-        <tr><td>{a[35]}</td></tr>
-        <tr><td rowspan="2">{a[17]}</td><td>{a[36]}</td></tr>
-        <tr><td>{a[37]}</td></tr>
-        <tr><td rowspan="8">{a[3]}</td><td rowspan="4">{a[8]}</td><td rowspan="2">{a[18]}</td><td>{a[38]}</td></tr>
-        <tr><td>{a[39]}</td></tr>
-        <tr><td rowspan="2">{a[19]}</td><td>{a[40]}</td></tr>
-        <tr><td>{a[41]}</td></tr>
-        <tr><td rowspan="4">{a[9]}</td><td rowspan="2">{a[20]}</td><td>{a[42]}</td></tr>
-        <tr><td>{a[43]}</td></tr>
-        <tr><td rowspan="2">{a[21]}</td><td>{a[44]}</td></tr>
-        <tr><td>{a[45]}</td></tr>
+        <tr><td>{get_cell_html(16, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="2">{get_cell_html(8, pedigree_dict, record)}</td><td>{get_cell_html(17, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(18, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="4">{get_cell_html(4, pedigree_dict, record)}</td><td rowspan="2">{get_cell_html(9, pedigree_dict, record)}</td><td>{get_cell_html(19, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(20, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="2">{get_cell_html(10, pedigree_dict, record)}</td><td>{get_cell_html(21, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(22, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="8">{get_cell_html(2, pedigree_dict, record)}</td><td rowspan="4">{get_cell_html(5, pedigree_dict, record)}</td><td rowspan="2">{get_cell_html(11, pedigree_dict, record)}</td><td>{get_cell_html(23, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(24, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="2">{get_cell_html(12, pedigree_dict, record)}</td><td>{get_cell_html(25, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(26, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="4">{get_cell_html(6, pedigree_dict, record)}</td><td rowspan="2">{get_cell_html(13, pedigree_dict, record)}</td><td>{get_cell_html(27, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(28, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="2">{get_cell_html(14, pedigree_dict, record)}</td><td>{get_cell_html(29, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(30, pedigree_dict, record)}</td></tr>
         <tr>
-            <td class="dam-side" rowspan="16">{a[1]}</td>
-            <td rowspan="8">{a[4]}</td>
-            <td rowspan="4">{a[10]}</td>
-            <td rowspan="2">{a[22]}</td>
-            <td>{a[46]}</td>
+            <td class="dam-side" rowspan="16">{get_cell_html(31, pedigree_dict, record)}</td>
+            <td rowspan="8">{get_cell_html(32, pedigree_dict, record)}</td>
+            <td rowspan="4">{get_cell_html(34, pedigree_dict, record)}</td>
+            <td rowspan="2">{get_cell_html(38, pedigree_dict, record)}</td>
+            <td>{get_cell_html(46, pedigree_dict, record)}</td>
         </tr>
-        <tr><td>{a[47]}</td></tr>
-        <tr><td rowspan="2">{a[23]}</td><td>{a[48]}</td></tr>
-        <tr><td>{a[49]}</td></tr>
-        <tr><td rowspan="4">{a[11]}</td><td rowspan="2">{a[24]}</td><td>{a[50]}</td></tr>
-        <tr><td>{a[51]}</td></tr>
-        <tr><td rowspan="2">{a[25]}</td><td>{a[52]}</td></tr>
-        <tr><td>{a[53]}</td></tr>
-        <tr><td rowspan="8">{a[5]}</td><td rowspan="4">{a[12]}</td><td rowspan="2">{a[26]}</td><td>{a[54]}</td></tr>
-        <tr><td>{a[55]}</td></tr>
-        <tr><td rowspan="2">{a[27]}</td><td>{a[56]}</td></tr>
-        <tr><td>{a[57]}</td></tr>
-        <tr><td rowspan="4">{a[13]}</td><td rowspan="2">{a[28]}</td><td>{a[58]}</td></tr>
-        <tr><td>{a[59]}</td></tr>
-        <tr><td rowspan="2">{a[29]}</td><td>{a[60]}</td></tr>
-        <tr><td>{a[61]}</td></tr>
+        <tr><td>{get_cell_html(47, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="2">{get_cell_html(39, pedigree_dict, record)}</td><td>{get_cell_html(48, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(49, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="4">{get_cell_html(35, pedigree_dict, record)}</td><td rowspan="2">{get_cell_html(40, pedigree_dict, record)}</td><td>{get_cell_html(50, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(51, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="2">{get_cell_html(41, pedigree_dict, record)}</td><td>{get_cell_html(52, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(53, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="8">{get_cell_html(33, pedigree_dict, record)}</td><td rowspan="4">{get_cell_html(36, pedigree_dict, record)}</td><td rowspan="2">{get_cell_html(42, pedigree_dict, record)}</td><td>{get_cell_html(54, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(55, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="2">{get_cell_html(43, pedigree_dict, record)}</td><td>{get_cell_html(56, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(57, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="4">{get_cell_html(37, pedigree_dict, record)}</td><td rowspan="2">{get_cell_html(44, pedigree_dict, record)}</td><td>{get_cell_html(58, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(59, pedigree_dict, record)}</td></tr>
+        <tr><td rowspan="2">{get_cell_html(45, pedigree_dict, record)}</td><td>{get_cell_html(60, pedigree_dict, record)}</td></tr>
+        <tr><td>{get_cell_html(61, pedigree_dict, record)}</td></tr>
     </table>
 </body>
 </html>
 """
-    return html_body
+    return html_content
 
 
-def generate_pedigree_image(horse_id):
-    """実行メイン関数"""
-    os.makedirs(HTML_DIR, exist_ok=True)
-    os.makedirs(IMG_DIR, exist_ok=True)
+# ---------------------------------------------------------
+# メイン実行関数
+# ---------------------------------------------------------
 
-    # 1. データ取得と並び替え
-    name, ancestors = get_pedigree_data(horse_id)
-    if not name:
+
+def generate_pedigree_image(
+    horse_id: str,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """
+    指定馬IDの血統表をHTMLおよびPNG画像として生成・保存する.
+
+    既にHTMLと画像が両方存在する場合はスキップする.
+
+    Args:
+        horse_id (str): 馬ID.
+        logger (Optional[logging.Logger]): ロガー. 省略時は自動生成.
+
+    Returns:
+        None
+
+    Example:
+        generate_pedigree_image("0001352760", logger)
+    """
+
+    # ---------------------------------------------------------
+    # ロガーの初期化（未指定時は自動生成）
+    # ---------------------------------------------------------
+
+    if logger is None:
+        logger = setup_logger(
+            log_filepath="logs/pedigree_visualizer.log",
+            log_level="INFO",
+            logger_name=__name__,
+        )
+
+    safe_id = str(horse_id).zfill(10)
+    html_path = HTML_DIR / f"{safe_id}.html"
+    img_path = IMG_DIR / f"{safe_id}.png"
+
+    # 既に両ファイルが存在する場合は処理をスキップする
+    if html_path.exists() and img_path.exists():
+        logger.info(f"スキップ（既存）: {safe_id}")
         return
 
-    # 2. HTML生成
-    html = build_html(name, ancestors)
+    HTML_DIR.mkdir(parents=True, exist_ok=True)
+    IMG_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 3. ファイル保存
-    safe_id = str(horse_id).zfill(10)
-    html_path = os.path.join(HTML_DIR, f"{safe_id}.html")
-    img_path = os.path.join(IMG_DIR, f"{safe_id}.png")
+    # ---------------------------------------------------------
+    # DBから血統データを取得する
+    # ---------------------------------------------------------
 
-    with open(html_path, "w", encoding="utf-8") as f:
+    record = get_pedigree_data(horse_id, logger)
+    if not record:
+        return
+
+    # ---------------------------------------------------------
+    # 5代血統表リスト・dictを生成する
+    # ---------------------------------------------------------
+
+    name = record["name"]
+    raw_list = [x.strip() for x in record["five_gen_ancestors"].split(",") if x.strip()]
+
+    # 先頭に対象馬名が含まれている場合は除去する
+    if len(raw_list) == 63:
+        raw_list = raw_list[1:]
+
+    # 62件に満たない場合は空文字で補完する
+    while len(raw_list) < 62:
+        raw_list.append("")
+
+    pedigree_dict: Dict[int, str] = {i: raw_list[i] for i in range(62)}
+
+    # ---------------------------------------------------------
+    # HTML生成・ファイル保存
+    # ---------------------------------------------------------
+
+    html = build_html(name, pedigree_dict, record)
+
+    with html_path.open("w", encoding="utf-8") as f:
         f.write(html)
 
-    # 4. PNG変換
+    # ---------------------------------------------------------
+    # wkhtmltoimage による画像変換
+    # ---------------------------------------------------------
+
     try:
         subprocess.run(
             [
@@ -178,18 +393,38 @@ def generate_pedigree_image(horse_id):
                 "--width",
                 "1150",
                 "--disable-smart-width",
-                html_path,
-                img_path,
+                str(html_path),
+                str(img_path),
             ],
             check=True,
             capture_output=True,
         )
-        print(f"Success: {img_path}")
+        logger.info(f"画像生成成功 : {img_path}")
     except Exception as e:
-        print(f"Error during image conversion: {e}")
+        logger.error(f"画像変換エラー : {e}")
+
+
+# ---------------------------------------------------------
+# 簡易単体テスト
+# ---------------------------------------------------------
+
+
+def _run_tests() -> None:
+    """主要機能の動作確認テストを実行する."""
+
+    logger = setup_logger(
+        log_filepath="logs/pedigree_visualizer_test.log",
+        log_level="INFO",
+        logger_name="pedigree_visualizer_test",
+    )
+
+    print("\n--- 正常系 : 画像生成テスト ---")
+    generate_pedigree_image("0001352760", logger)
+
+    print("\n--- 異常系 : 存在しないID ---")
+    generate_pedigree_image("9999999999", logger)
 
 
 if __name__ == "__main__":
-    # python -m utils.pedigree_visualizer
-    # テスト実行: クロワデュノール
-    generate_pedigree_image("0001352760")
+    # 実行コマンド: python -m src.utils.pedigree_visualizer
+    _run_tests()

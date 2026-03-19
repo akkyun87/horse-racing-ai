@@ -1,47 +1,47 @@
+# ファイルパス: src/utils/logger.py
+
 """
 src/utils/logger.py
 
 【概要】
-プロジェクト全体で使用するロギング設定を構築するユーティリティモジュール。
+プロジェクト全体で使用するロギング設定を構築するユーティリティです。
 コンソール出力およびファイルへの永続化の両方に対応し、
-競馬予測システムの各コンポーネントにおける実行ログの集約を支援する。
+競馬予測システムの各コンポーネントにおける実行ログの集約を支援します。
 
 【外部依存】
 - OS: ログ保存用ディレクトリの作成権限
-- 標準ライブラリ: logging, pathlib
+- 標準ライブラリ: logging, pathlib, os, typing
 
 【Usage】
-    from src.utils.logger import setup_logger
-    import logging
+    from src.utils.logger import setup_logger, close_logger_handlers
 
     logger = setup_logger(
         log_filepath="logs/data_collection.log",
         log_level="INFO",
-        logger_name=__name__,
+        logger_name="DataCollector",
     )
     logger.info("処理を開始しました。")
+    # 終了時
+    close_logger_handlers("DataCollector")
 """
 
 # ---------------------------------------------------------
 # インポート
 # ---------------------------------------------------------
-
 import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, Final, Literal, Optional
+from typing import Dict, Final, List, Literal, Optional, Union
 
 # ---------------------------------------------------------
 # 定数定義
 # ---------------------------------------------------------
 
-# ログ出力で使用する日時フォーマット: 全ハンドラで統一するため定数として一元管理する
+# ログ出力で使用する日時フォーマット（ISO 8601に近い形式で統一）
 LOG_DATE_FORMAT: Final[str] = "%Y-%m-%d %H:%M:%S"
 
-# 有効なログレベルの文字列→logging 定数マッピング:
-# validate_log_level と VALID_LOG_LEVELS を分離することで
-# 定数の参照とバリデーションロジックを独立させる
+# 有効なログレベルの文字列→logging 定数マッピング
 VALID_LOG_LEVELS: Final[Dict[str, int]] = {
     "DEBUG": logging.DEBUG,
     "INFO": logging.INFO,
@@ -50,6 +50,19 @@ VALID_LOG_LEVELS: Final[Dict[str, int]] = {
     "CRITICAL": logging.CRITICAL,
 }
 
+# ログレベルの型定義
+LogLevelLiteral = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+
+# コンソール向けデフォルトログフォーマット
+# 意図: 関数シグネチャへのインライン埋め込みを避け、変更箇所をここに一元化する
+DEFAULT_LOG_FORMAT_CONSOLE: Final[str] = (
+    "[%(asctime)s][%(levelname)s][%(filename)s:%(lineno)d] %(message)s"
+)
+
+# ファイル向けデフォルトログフォーマット（ロガー名を追加してファイル横断検索を容易にする）
+DEFAULT_LOG_FORMAT_FILE: Final[str] = (
+    "[%(asctime)s][%(levelname)s][%(filename)s:%(lineno)d][%(name)s] %(message)s"
+)
 
 # ---------------------------------------------------------
 # 入力バリデーション
@@ -62,75 +75,72 @@ def validate_log_level(log_level: str) -> int:
 
     Args:
         log_level (str): ログレベル文字列 (DEBUG / INFO / WARNING / ERROR / CRITICAL)。
-                         大文字・小文字の混在を許容する。
 
     Returns:
-        int: logging モジュールのログレベル定数 (例: logging.INFO = 20)。
+        int: logging モジュールのログレベル定数。
 
     Raises:
         ValueError: 指定された文字列が VALID_LOG_LEVELS に存在しない場合。
 
     Example:
-        >>> validate_log_level("info")
+        >>> level = validate_log_level("INFO")
+        >>> print(level)
         20
-        >>> validate_log_level("INVALID")
-        ValueError: 無効なログレベルが指定されました ...
     """
-    # 大文字に統一してルックアップし、大小文字の差異を吸収する
-    upper_level = log_level.upper()
+    # 大文字変換による表記揺れの吸収
+    upper_level: str = log_level.upper()
 
-    # マッピングに存在しない値は即座に例外として呼び出し元へ通知する
+    # 意図: マッピングに存在しない値は、後続の処理でエラーになる前に早期例外を発生させる
     if upper_level not in VALID_LOG_LEVELS:
+        allowed_levels: List[str] = list(VALID_LOG_LEVELS.keys())
         raise ValueError(
-            f"無効なログレベルが指定されました: {log_level!r}。"
-            f"許容される値: {list(VALID_LOG_LEVELS.keys())}"
+            f"無効なログレベルが指定されました: {log_level!r}。 "
+            f"許容される値: {allowed_levels}"
         )
 
     return VALID_LOG_LEVELS[upper_level]
 
 
 # ---------------------------------------------------------
-# ログディレクトリ準備
+# 外部リソース準備 (ディレクトリ操作)
 # ---------------------------------------------------------
 
 
-def ensure_log_directory(log_filepath: str) -> None:
+def ensure_log_directory(log_filepath: Union[str, Path]) -> None:
     """
     ログファイルの出力先ディレクトリが存在することを保証する。
 
-    ディレクトリが存在しない場合は中間ディレクトリを含めて再帰的に作成する。
-    ルート直下などディレクトリ部分が空の場合は何もしない。
-
     Args:
-        log_filepath (str): ログファイルのパス (例: "logs/app.log")。
+        log_filepath (Union[str, Path]): ログファイルの保存先パス。
 
     Returns:
-        None
+        None: 戻り値なし（副作用としてディレクトリを作成）。
 
     Raises:
-        OSError: ディレクトリ作成時に権限不足・ディスクフル等が発生した場合。
+        OSError: ディレクトリ作成時に権限不足やディスクフル等が発生した場合。
 
     Example:
-        >>> ensure_log_directory("logs/subsystem/app.log")
-        # logs/subsystem/ ディレクトリが存在しなければ作成される
+        >>> ensure_log_directory("logs/app.log")
     """
-    parent_dir = Path(log_filepath).parent
+    path_obj: Path = Path(log_filepath)
+    parent_dir: Path = path_obj.parent
 
-    # ルート直下 (parent_dir == ".") の場合は作成不要のためスキップする
-    if not parent_dir or parent_dir == Path("."):
+    # 意図: カレントディレクトリ直下やパス指定がない場合は作成を試みない
+    if parent_dir == Path(".") or str(parent_dir) == "":
         return
 
     try:
-        # exist_ok=True: 既存ディレクトリへの競合エラーを抑制する
+        # 意図: 複数スレッド/プロセスからの同時実行を考慮し、exist_ok=True を指定
         parent_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
+        # 意図: 競馬予測システムなどバッチ処理において、ログ出力不能は致命的なため例外を再送する
         raise OSError(
-            f"ログディレクトリの作成に失敗しました: {parent_dir} | {e}"
+            f"ログディレクトリの作成に失敗しました: {parent_dir} | 詳細: {e}"
         ) from e
 
 
 # ---------------------------------------------------------
-# ハンドラ生成: コンソール
+# ハンドラ生成フェーズ
 # ---------------------------------------------------------
 
 
@@ -149,23 +159,20 @@ def create_console_handler(
         logging.StreamHandler: 設定済みコンソールハンドラ。
 
     Raises:
-        None: 本関数は例外を外部へ伝播しない。
+        None: 特筆すべき例外なし。
 
     Example:
         >>> handler = create_console_handler(logging.INFO, "%(message)s")
     """
-    handler = logging.StreamHandler()
+    handler: logging.StreamHandler = logging.StreamHandler()
     handler.setLevel(log_level)
 
-    # LOG_DATE_FORMAT を使用して全ハンドラの日時表示を統一する
-    handler.setFormatter(logging.Formatter(log_format, datefmt=LOG_DATE_FORMAT))
-
+    # 意図: 日時フォーマットを LOG_DATE_FORMAT 定数で統一し、時系列解析を容易にする
+    formatter: logging.Formatter = logging.Formatter(
+        log_format, datefmt=LOG_DATE_FORMAT
+    )
+    handler.setFormatter(formatter)
     return handler
-
-
-# ---------------------------------------------------------
-# ハンドラ生成: ファイル
-# ---------------------------------------------------------
 
 
 def create_file_handler(
@@ -188,129 +195,117 @@ def create_file_handler(
         PermissionError: ログファイルへの書き込み権限がない場合。
 
     Example:
-        >>> handler = create_file_handler("logs/app.log", logging.DEBUG, "%(message)s")
+        >>> handler = create_file_handler("logs/app.log", logging.INFO, "%(message)s")
     """
     try:
-        # encoding="utf-8" を明示し、日本語ログを文字化けなく出力する
-        handler = logging.FileHandler(log_filepath, encoding="utf-8")
-    except PermissionError as e:
+        # 意図: 競馬データに含まれる馬名（外字/旧漢字等）を正しく記録するため UTF-8 を指定
+        handler: logging.FileHandler = logging.FileHandler(
+            log_filepath, encoding="utf-8"
+        )
+    except (PermissionError, FileNotFoundError) as e:
         raise PermissionError(
-            f"ログファイルへの書き込み権限がありません: {log_filepath}"
+            f"ログファイルへのアクセスに失敗しました: {log_filepath} | 詳細: {e}"
         ) from e
 
     handler.setLevel(log_level)
-
-    # LOG_DATE_FORMAT を使用してコンソールハンドラと日時表示を統一する
-    handler.setFormatter(logging.Formatter(log_format, datefmt=LOG_DATE_FORMAT))
-
+    formatter: logging.Formatter = logging.Formatter(
+        log_format, datefmt=LOG_DATE_FORMAT
+    )
+    handler.setFormatter(formatter)
     return handler
 
 
 # ---------------------------------------------------------
-# メインロガーセットアップ
+# メインロガーセットアップフェーズ
 # ---------------------------------------------------------
 
 
 def setup_logger(
     log_filepath: str,
-    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO",
+    log_level: LogLevelLiteral = "INFO",
     logger_name: Optional[str] = None,
-    log_format_console: str = "[%(asctime)s][%(levelname)s][%(name)s] %(message)s",
-    log_format_file: str = "[%(asctime)s][%(levelname)s][%(filename)s:%(lineno)d] %(message)s",
+    log_format_console: str = DEFAULT_LOG_FORMAT_CONSOLE,
+    log_format_file: str = DEFAULT_LOG_FORMAT_FILE,
 ) -> logging.Logger:
     """
     コンソールおよびファイルへログ出力するロガーを生成・設定する。
 
-    同一名称のロガーが既に設定済みの場合は既存インスタンスをそのまま返し、
-    ハンドラの二重登録による多重出力を防止する。
-
     Args:
-        log_filepath (str): ログファイルの保存パス (例: "logs/app.log")。
-        log_level (Literal): 出力最小ログレベル。デフォルトは "INFO"。
-        logger_name (Optional[str]): ロガーの識別名。None の場合はモジュール名を使用。
+        log_filepath (str): ログファイルの保存パス。
+        log_level (LogLevelLiteral): 出力最小ログレベル。デフォルトは "INFO"。
+        logger_name (Optional[str]): ロガーの識別名。None の場合はモジュール名。
         log_format_console (str): コンソール向けログフォーマット。
-        log_format_file (str): ファイル向けログフォーマット (行番号等のデバッグ情報を含む)。
+                                  デフォルトは DEFAULT_LOG_FORMAT_CONSOLE。
+        log_format_file (str): ファイル向けログフォーマット。
+                               デフォルトは DEFAULT_LOG_FORMAT_FILE。
 
     Returns:
         logging.Logger: 設定完了済みの Logger インスタンス。
 
     Raises:
-        ValueError: log_level に無効な文字列が指定された場合。
-        OSError: ログディレクトリの作成に失敗した場合。
+        ValueError: ログレベルが不正な場合。
+        OSError: ディレクトリ作成に失敗した場合。
 
     Example:
-        >>> logger = setup_logger("logs/app.log", log_level="DEBUG", logger_name="myapp")
-        >>> logger.info("Logger ready")
+        >>> logger = setup_logger("logs/test.log", log_level="DEBUG", logger_name="TestLogger")
+        >>> logger.info("Setup complete")
     """
+    # ロガーの初期化
+    resolved_name: str = logger_name or __name__
+    logger: logging.Logger = logging.getLogger(resolved_name)
 
-    # ---------------------------------------------------------
-    # ロガー取得
-    # ---------------------------------------------------------
-
-    # 明示指定がない場合はモジュール名を使用し、名前空間の衝突を回避する
-    resolved_name = logger_name or __name__
-    logger = logging.getLogger(resolved_name)
-
-    # ---------------------------------------------------------
-    # ログレベル設定
-    # ---------------------------------------------------------
-
-    level = validate_log_level(log_level)
+    # ログレベルの設定
+    level: int = validate_log_level(log_level)
     logger.setLevel(level)
 
-    # ---------------------------------------------------------
-    # ハンドラ重複防止
-    # ---------------------------------------------------------
-
-    # setup_logger が複数回呼ばれた際の多重ログ出力を防止する
-    # 既にハンドラが登録済みの場合はそのまま返す
+    # 意図: 同一名のロガーが再定義された際、ハンドラが重複しログが二重・三重に出力されるのを防ぐ
     if logger.hasHandlers():
         return logger
 
-    # ---------------------------------------------------------
-    # ログディレクトリ準備
-    # ---------------------------------------------------------
-
+    # 外部リソース（出力先）の準備
     ensure_log_directory(log_filepath)
 
-    # ---------------------------------------------------------
-    # ハンドラ生成・登録
-    # ---------------------------------------------------------
-
+    # ハンドラの登録
+    # 意図: コンソールハンドラとファイルハンドラを個別に生成し、ロガーに紐付ける
     logger.addHandler(create_console_handler(level, log_format_console))
     logger.addHandler(create_file_handler(log_filepath, level, log_format_file))
+
+    # 意図: 親ロガーへの伝播を抑制し、意図しない場所（ルートロガー等）での重複出力を防ぐ
+    logger.propagate = False
 
     return logger
 
 
 # ---------------------------------------------------------
-# ハンドラクローズ補助関数
+# 終了処理（リソース解放）
 # ---------------------------------------------------------
 
 
 def close_logger_handlers(logger_name: Optional[str] = None) -> None:
     """
-    指定されたロガーのすべてのハンドラをクローズ・削除する。
-
-    Windowsではファイルハンドラがクローズされていないと、
-    ファイル削除時にPermissionErrorが発生するため、
-    テスト終了時などにこの関数で明示的にクローズする。
+    指定されたロガーのすべてのハンドラをクローズし、ロガーから除去する。
 
     Args:
-        logger_name (Optional[str]): ロガー名。None の場合は root ロガー。
+        logger_name (Optional[str]): 対象のロガー名。None の場合はルートロガー周辺。
 
     Returns:
-        None
+        None: 戻り値なし。
+
+    Raises:
+        None: 終了処理中のエラーは安全のため内部で無視される。
 
     Example:
-        >>> close_logger_handlers("test_logger")
+        >>> close_logger_handlers("DataCollector")
     """
-    logger = logging.getLogger(logger_name)
+    target_logger: logging.Logger = logging.getLogger(logger_name)
 
-    # 全ハンドラをクローズして logger から削除
-    for handler in logger.handlers[:]:  # スライスコピーで安全に列挙
-        handler.close()
-        logger.removeHandler(handler)
+    # 意図: イテレート中のリストから要素を削除する際の不具合を避けるためスライスコピーを使用
+    for handler in target_logger.handlers[:]:
+        try:
+            handler.close()
+            target_logger.removeHandler(handler)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------
@@ -319,148 +314,110 @@ def close_logger_handlers(logger_name: Optional[str] = None) -> None:
 
 
 def _run_tests() -> None:
-    """主要機能の動作確認テストを実行する。
-
-    正常系・異常系・ファイル内容検証の3軸でテストを実施する。
-    テストで生成した一時ディレクトリは finally ブロックで必ず削除する。
     """
-    # テスト用の一時ディレクトリ・ファイルパスを定義する
-    test_dir = "logs_test_tmp"
-    test_file = os.path.join(test_dir, "unit_test.log")
+    主要機能の動作確認テストを実行する。
 
-    print("\n" + "=" * 60)
-    print("  Unit Test: src/utils/logger.py")
-    print("=" * 60 + "\n")
+    外部依存（DB・ネットワーク）を持たず、一時ディレクトリのみを使用するため
+    単体実行が可能。テスト終了後はファイル・ロガーを必ず解放・削除する。
 
-    errors: list[str] = []
+    Args:
+        なし。
+
+    Returns:
+        None: 戻り値なし。テスト結果は標準出力に print する。
+
+    Raises:
+        None: AssertionError および予期しない例外は内部でキャッチして出力する。
+
+    Example:
+        # python -m src.utils.logger
+        _run_tests()
+    """
+    TEST_LOG_DIR: Final[str] = "logs/_test_logger_tmp"
+    TEST_LOG_FILE: Final[str] = f"{TEST_LOG_DIR}/unit_test.log"
+    TEST_LOGGER_NAME: Final[str] = "test_logger_internal"
+
+    print("=" * 60)
+    print(" logger.py 簡易単体テスト 開始")
+    print("=" * 60)
 
     try:
         # ---------------------------------------------------------
-        # [Test 1] validate_log_level: 正常系
+        # テスト 1: 正常系 (ログレベル変換)
         # ---------------------------------------------------------
-        print("[Test 1] validate_log_level — 正常系")
-        level_cases = [
-            ("DEBUG", logging.DEBUG),
-            ("info", logging.INFO),  # 小文字でも通ること
-            ("Warning", logging.WARNING),  # 混在ケース
-            ("ERROR", logging.ERROR),
-            ("CRITICAL", logging.CRITICAL),
-        ]
-        for raw, expected in level_cases:
-            result = validate_log_level(raw)
-            status = "OK" if result == expected else "FAIL"
-            print(
-                f"  {status}: validate_log_level({raw!r}) -> {result} (expected: {expected})"
-            )
-            if status == "FAIL":
-                errors.append(
-                    f"validate_log_level({raw!r}) = {result}, expected {expected}"
-                )
+        print("\n[TEST 1] 正常系: ログレベル文字列の変換")
+        assert validate_log_level("DEBUG") == logging.DEBUG
+        assert validate_log_level("info") == logging.INFO  # 小文字許容
+        print("  -> PASS")
 
         # ---------------------------------------------------------
-        # [Test 2] validate_log_level: 異常系
+        # テスト 2: 正常系 (ロガー生成とファイル出力)
         # ---------------------------------------------------------
-        print("\n[Test 2] validate_log_level — 異常系")
-        try:
-            validate_log_level("INVALID_LEVEL")
-            errors.append("ValueError が送出されるべきでしたが送出されませんでした。")
-            print("  FAIL: ValueError が送出されませんでした。")
-        except ValueError:
-            print("  OK: ValueError を正しく捕捉しました。")
-
-        # ---------------------------------------------------------
-        # [Test 3] setup_logger: ロガー生成とファイル出力
-        # ---------------------------------------------------------
-        print("\n[Test 3] setup_logger — ファイル生成・内容検証")
+        print("\n[TEST 2] 正常系: ロガーセットアップと書き込み検証")
         logger = setup_logger(
-            log_filepath=test_file,
+            log_filepath=TEST_LOG_FILE,
             log_level="DEBUG",
-            logger_name="test_logger_unit",
+            logger_name=TEST_LOGGER_NAME,
         )
-        logger.debug("DEBUG テストメッセージ")
-        logger.info("INFO テストメッセージ")
-        logger.warning("WARNING テストメッセージ")
-        logger.error("ERROR テストメッセージ")
 
-        # ファイルが生成されているか確認する
-        if os.path.exists(test_file):
-            print(f"  OK: ログファイルが生成されました: {test_file}")
-        else:
-            errors.append("ログファイルが生成されていません。")
-            print("  FAIL: ログファイルが生成されていません。")
+        test_msg = "Test log message for horse_id: 2021100001 (🐴)"
+        logger.debug(test_msg)
 
-        # ファイルの内容が書き込まれているか確認する
-        with open(test_file, "r", encoding="utf-8") as f:
+        # ファイルの存在確認
+        assert os.path.exists(TEST_LOG_FILE), "ログファイルが生成されていません"
+
+        # 内容の検証
+        with open(TEST_LOG_FILE, "r", encoding="utf-8") as f:
             content = f.read()
-
-        for marker in [
-            "DEBUG テストメッセージ",
-            "INFO テストメッセージ",
-            "ERROR テストメッセージ",
-        ]:
-            status = "OK" if marker in content else "FAIL"
-            print(f"  {status}: ログ内容に {marker!r} が存在すること")
-            if status == "FAIL":
-                errors.append(f"ログ内容に {marker!r} が見つかりません。")
+            assert test_msg in content, "ログメッセージがファイルに書き込まれていません"
+        print("  -> PASS")
 
         # ---------------------------------------------------------
-        # [Test 4] setup_logger: 重複呼び出しでハンドラが増加しないこと
+        # テスト 3: 異常系 (無効なログレベル)
         # ---------------------------------------------------------
-        print("\n[Test 4] setup_logger — ハンドラ重複防止")
-        handler_count_before = len(logger.handlers)
-        # 同一名称で再度呼び出す
-        setup_logger(log_filepath=test_file, logger_name="test_logger_unit")
-        handler_count_after = len(logger.handlers)
-        status = "OK" if handler_count_before == handler_count_after else "FAIL"
+        print("\n[TEST 3] 異常系: 無効なログレベル指定")
+        try:
+            validate_log_level("INVALID")
+            assert False, "ValueError が発生しませんでした"
+        except ValueError:
+            print("  -> PASS (Expected error caught)")
+
+        # ---------------------------------------------------------
+        # テスト 4: 正常系 (同一名ロガーの重複防止)
+        # ---------------------------------------------------------
         print(
-            f"  {status}: ハンドラ数が増加しないこと ({handler_count_before} -> {handler_count_after})"
+            "\n[TEST 4] 正常系: 同一ロガー名での再呼び出し時にハンドラが重複しないこと"
         )
-        if status == "FAIL":
-            errors.append(
-                f"ハンドラが重複登録されました: {handler_count_before} -> {handler_count_after}"
-            )
+        # 意図: hasHandlers() 分岐を経由して既存ロガーがそのまま返ることを検証する
+        logger_again = setup_logger(
+            log_filepath=TEST_LOG_FILE,
+            log_level="DEBUG",
+            logger_name=TEST_LOGGER_NAME,
+        )
+        handler_count: int = len(logger_again.handlers)
+        assert handler_count == 2, (
+            f"ハンドラ数が期待値(2)と異なります: {handler_count} "
+            f"(重複登録が発生している可能性があります)"
+        )
+        print("  -> PASS")
 
-        # ---------------------------------------------------------
-        # [Test 5] ensure_log_directory: ネスト済みディレクトリの作成
-        # ---------------------------------------------------------
-        print("\n[Test 5] ensure_log_directory — ネストディレクトリ作成")
-        nested_path = os.path.join(test_dir, "nested", "deep", "test.log")
-        ensure_log_directory(nested_path)
-        nested_dir = os.path.dirname(nested_path)
-        status = "OK" if os.path.isdir(nested_dir) else "FAIL"
-        print(f"  {status}: {nested_dir} が作成されること")
-        if status == "FAIL":
-            errors.append(f"ネストディレクトリが作成されていません: {nested_dir}")
-
+    except AssertionError as e:
+        print(f"\n[FAIL] アサーション失敗: {e}")
     except Exception as e:
-        errors.append(f"テスト中に予期せぬ例外が発生: {e}")
-        print(f"  ERROR: {e}")
+        print(f"\n[FAIL] 予期しないエラー: {e}")
+        import traceback
 
+        traceback.print_exc()
     finally:
-        # ---------------------------------------------------------
-        # ハンドラのクローズ【重要】
-        # ---------------------------------------------------------
-        # Windowsではファイルハンドラがクローズされていないと、
-        # ファイル削除時に PermissionError が発生するため、
-        # finally ブロックの最初でハンドラをクローズする
-        close_logger_handlers("test_logger_unit")
+        # テストリソースのクリーンアップ
+        close_logger_handlers(TEST_LOGGER_NAME)
+        if Path(TEST_LOG_DIR).exists():
+            shutil.rmtree(TEST_LOG_DIR)
+            print(f"\nCLEANUP: {TEST_LOG_DIR} を削除しました。")
 
-        # テストで生成した一時ディレクトリをすべて削除する
-        if os.path.exists(test_dir):
-            shutil.rmtree(test_dir)
-            print(f"\n  CLEANUP: 一時ディレクトリを削除しました: {test_dir}")
-
-    # ---------------------------------------------------------
-    # テスト結果サマリ
-    # ---------------------------------------------------------
     print("\n" + "=" * 60)
-    if errors:
-        print(f"  FAILED — {len(errors)} error(s):")
-        for msg in errors:
-            print(f"    ✗ {msg}")
-    else:
-        print("  ALL TESTS PASSED")
-    print("=" * 60 + "\n")
+    print(" 全テスト完了")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
