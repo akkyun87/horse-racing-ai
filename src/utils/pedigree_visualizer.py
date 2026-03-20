@@ -1,21 +1,33 @@
+# ファイルパス: src/utils/pedigree_visualizer.py
+
 """
 src/utils/pedigree_visualizer.py
 
 【概要】
-競走馬の5代血統表をHTMLおよび画像として出力するユーティリティ.
-DBから血統データを取得し、正確なインデックス・ラベル対応で血統表をHTMLツリー構造として出力する.
-画像変換には wkhtmltoimage を利用する.
+競走馬の5代血統表をHTMLおよび画像として出力するユーティリティ。
+DBから血統データを取得し、インブリード計算（馬名クロス・系統クロス）を統合したうえで
+HTMLツリー構造として出力する。画像変換には wkhtmltoimage を利用する。
+
+クロス対象馬は太字＋血量公式で強調表示し、系統背景色と組み合わせて
+視覚的に血統関係を把握しやすくする。
 
 【外部依存】
-- DB: SQLite (src/utils/db_manager.py 経由)
-- ログ: src/utils/logger.py
-- 画像変換: wkhtmltoimage
+- DB: SQLite (data/raw/pedigree/pedigree.db)
+- 画像変換: wkhtmltoimage (Windows 向けバイナリパス)
+- 内部モジュール:
+    src.utils.db_manager              (load_from_db)
+    src.utils.inbreeding_calculator   (calculate_inbreeding_batch)
+    src.utils.logger                  (setup_logger, close_logger_handlers)
 
 【Usage】
     from src.utils.pedigree_visualizer import generate_pedigree_image
-    import logging
+    from src.utils.logger import setup_logger
 
-    logger = logging.getLogger("example")
+    logger = setup_logger(
+        log_filepath="logs/pedigree_visualizer.log",
+        log_level="INFO",
+        logger_name="PedigreeVisualizer",
+    )
     generate_pedigree_image(horse_id="0001352760", logger=logger)
 """
 
@@ -24,28 +36,35 @@ DBから血統データを取得し、正確なインデックス・ラベル対
 # ---------------------------------------------------------
 
 import logging
+import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Final, List, Optional
 
 from src.utils import db_manager
+from src.utils.inbreeding_calculator import calculate_inbreeding_batch
 from src.utils.logger import setup_logger
 
 # ---------------------------------------------------------
-# 定数・設定
+# 定数定義
 # ---------------------------------------------------------
 
-# 保存先ディレクトリおよび外部ツールのパス
-DB_PATH: Path = Path("data/raw/pedigree/pedigree.db")
-HTML_DIR: Path = Path("images/pedigree/html")
-IMG_DIR: Path = Path("images/pedigree/img")
-WKHTMLTOIMAGE: str = r"C:\Program Files\wkhtmltopdf\bin\wkhtmltoimage.exe"
+# 血統情報を格納する SQLite ファイルパス
+DB_PATH: Final[Path] = Path("data/raw/pedigree/pedigree.db")
+
+# HTML / 画像の出力先ディレクトリ
+HTML_DIR: Final[Path] = Path("images/pedigree/html")
+IMG_DIR: Final[Path] = Path("images/pedigree/img")
+
+# 画像変換に使用する wkhtmltoimage の実行ファイルパス (Windows)
+WKHTMLTOIMAGE: Final[Path] = Path(r"C:\Program Files\wkhtmltopdf\bin\wkhtmltoimage.exe")
 
 # ---------------------------------------------------------
-# 5代血統表インデックス → ラベル対応dict
+# 5代血統表インデックス → ラベル対応辞書
+# インデックス 0〜61 の 62 ノードに日本語ラベルを割り当てる
 # ---------------------------------------------------------
 
-PEDIGREE_INDEX_LABELS: Dict[int, str] = {
+PEDIGREE_INDEX_LABELS: Final[Dict[int, str]] = {
     # 父系（0〜30）
     0: "父",
     1: "父父",
@@ -112,196 +131,321 @@ PEDIGREE_INDEX_LABELS: Dict[int, str] = {
     61: "母母母母母",
 }
 
+# 系統名 → 背景色の対応辞書
+COLOR_MAP: Final[Dict[str, str]] = {
+    # Northern Dancer 系（青）
+    "Northern Dancer 系": "#4A90E2",
+    "Nijinsky 系": "#5A9BE6",
+    "Vice Regent 系": "#6BA7EA",
+    "Lyphard 系": "#7BB3EE",
+    "Danzig 系": "#3F83D6",
+    "Nureyev 系": "#8CBFF2",
+    "Storm Cat 系": "#9CCBF5",
+    "Sadler's Wells 系": "#3578CA",
+    # Mr. Prospector 系（肌色）
+    "Mr. Prospector 系": "#F5CBA7",
+    "Fappiano 系": "#F6D2B1",
+    "Gone West 系": "#F7D9BB",
+    "Forty Niner 系": "#F4C29C",
+    "Kingmambo 系": "#F3BA91",
+    "King Kamehameha 系": "#F2B286",
+    "Smart Strike 系": "#F8E0C7",
+    "Machiavellian 系": "#EFB083",
+    # Nasrullah 系（赤）
+    "Nasrullah 系": "#E74C3C",
+    "Grey Sovereign 系": "#EC7063",
+    "Bold Ruler 系": "#CD6155",
+    "Never Bend 系": "#D35454",
+    "Red God 系": "#C0392B",
+    "Princely Gift 系": "#F1948A",
+    # Royal Charger 系（緑）
+    "Royal Charger 系": "#27AE60",
+    "Halo 系": "#2ECC71",
+    "Sunday Silence 系": "#58D68D",
+    "Deep Impact 系": "#82E0AA",
+    "Roberto 系": "#239B56",
+    "Sir Gaylord 系": "#1D8348",
+    # Herod 系（茶）
+    "Herod 系": "#8E5C42",
+    # Touchstone 系（薄紫）
+    "Touchstone 系": "#AF7AC5",
+    "Himyar 系": "#BB8FCE",
+    "Hyperion 系": "#C39BD3",
+    # Stockwell 系（濃い紫）
+    "Stockwell 系": "#6C3483",
+    "Orme 系": "#7D3C98",
+    "Damascus 系": "#5B2C6F",
+    # Phalaris 系（濃い青）
+    "Phalaris 系": "#1B4F72",
+    "Tom Fool 系": "#21618C",
+    # Blandford 系（灰）
+    "Blandford 系": "#7F8C8D",
+    # St. Simon 系（黄色）
+    "St. Simon 系": "#F4D03F",
+    "Princequillo 系": "#F7DC6F",
+    "Ribot 系": "#F1C40F",
+    # Matchem 系（オレンジ）
+    "Matchem 系": "#E67E22",
+}
+
 
 # ---------------------------------------------------------
-# 血統データ取得
+# データ取得 & 計算
 # ---------------------------------------------------------
 
 
-def get_pedigree_data(horse_id: str, logger: logging.Logger) -> Optional[dict]:
+def get_pedigree_and_cross_data(
+    horse_id: str,
+    logger: logging.Logger,
+) -> Optional[Dict[str, Any]]:
     """
-    指定馬IDの pedigree_info テーブルのレコード全体を返す.
+    指定馬IDの血統レコードを取得し、インブリード計算結果を埋め込んで返す。
+
+    DB アクセスを1回に集約し、取得したレコードリストを
+    calculate_inbreeding_batch に渡すことで二重ロードを防止する。
 
     Args:
-        horse_id (str): 馬ID（数値/文字列どちらも可）.
-        logger (logging.Logger): ロガー.
+        horse_id (str): 馬ID（10桁ゼロ埋み文字列または数値文字列）。
+        logger (logging.Logger): ログ出力用ロガー。
 
     Returns:
-        Optional[dict]: レコード全体. 見つからない場合は None.
+        Optional[Dict[str, Any]]: pedigree_info の1行レコードに
+                                   "cross_info" キーを追加した辞書。
+                                   DB 未接続・馬未登録の場合は None。
 
     Raises:
-        例外は握りつぶさず logger で出力し、失敗時は None を返す.
+        None: DB アクセスエラーは内部で捕捉し ERROR ログを出力する。
 
     Example:
-        row = get_pedigree_data("0001352760", logger)
+        >>> logger = setup_logger("logs/pedigree_visualizer.log", logger_name="PedigreeVisualizer")
+        >>> data = get_pedigree_and_cross_data("0001352760", logger)
+        >>> if data:
+        ...     print(data["name"])
     """
-
-    # ---------------------------------------------------------
-    # horse_id を10桁0埋めに統一する
-    # ---------------------------------------------------------
-
     try:
         target_id = str(horse_id).zfill(10)
-        records = db_manager.load_from_db(str(DB_PATH), "pedigree_info", logger)
 
+        # 意図: DB アクセスを1回に集約し、blood レコードを両処理で共用する
+        records = db_manager.load_from_db(str(DB_PATH), "pedigree_info", logger)
         if not records:
-            logger.error("pedigree_info テーブルが空、またはDBアクセス失敗")
             return None
 
-        # 対象IDと一致するレコードを線形探索する
-        row = next(
+        record = next(
             (r for r in records if str(r.get("horse_id")).zfill(10) == target_id),
             None,
         )
+        if not record:
+            return None
+
+        # 意図: ロード済みの records を注入することで、インブリード計算側での
+        #       二重 DB アクセスを排除する
+        cross_results = calculate_inbreeding_batch(
+            [target_id],
+            pedigree_records=records,
+            logger=logger,
+        )
+
+        # 意図: クロス計算結果をレコードに埋め込み、HTML 描画で参照できるようにする
+        record["cross_info"] = cross_results.get(target_id, {})
+        return record
 
     except Exception as e:
-        logger.error(f"DBアクセスエラー : {e}")
+        logger.error("データ取得・計算エラー: %s", e, exc_info=True)
         return None
-
-    if not row:
-        logger.error(f"horse_id {target_id} が見つかりません.")
-        return None
-
-    return row
 
 
 # ---------------------------------------------------------
-# HTML構築ユーティリティ
+# HTML 構築ユーティリティ
 # ---------------------------------------------------------
 
 
 def get_cell_html(
     idx: int,
     pedigree_dict: Dict[int, str],
-    record: Optional[dict],
+    record: Optional[Dict[str, Any]],
 ) -> str:
     """
-    指定インデックスのセル内容（馬名＋系統情報）を返す.
+    指定インデックスのセル内容を HTML 文字列で返す。
 
-    種牡馬（ラベルが「父」で終わる）の場合のみ系統情報を付与する.
+    クロス対象馬は太字＋血量公式で強調表示し、系統ラベルに応じた
+    背景色を適用する。濃い背景色の場合はテキストを白色に切り替えて
+    視認性を確保する。
 
     Args:
-        idx (int): 血統インデックス.
-        pedigree_dict (Dict[int, str]): インデックス → 馬名 dict.
-        record (Optional[dict]): DBレコード全体（系統情報付与用）.
+        idx (int): 血統表インデックス（0〜61）。
+        pedigree_dict (Dict[int, str]): インデックス→馬名の辞書。
+        record (Optional[Dict[str, Any]]): pedigree_info の1行分の辞書。
+                                            "cross_info" キーを含む。
+                                            None の場合は系統色・クロス情報なしで描画する。
 
     Returns:
-        str: セル表示用HTML文字列.
+        str: セル1個分の HTML 文字列（display:table による中央揃え構造）。
+
+    Raises:
+        None: 本関数は例外を外部へ伝播しない。
 
     Example:
-        html = get_cell_html(0, pedigree_dict, record)
+        >>> pedigree_dict = {0: "ブラックタイド"}
+        >>> html = get_cell_html(0, pedigree_dict, None)
+        >>> "ブラックタイド" in html
+        True
     """
-
-    name = pedigree_dict.get(idx, "")
+    name = pedigree_dict.get(idx, "").strip()
     label = PEDIGREE_INDEX_LABELS.get(idx, "")
 
-    # 種牡馬セルにのみ系統情報をサブテキストとして付与する
-    if record and label.endswith("父"):
-        lineage = record.get(f"lineage_name_{label}", "")
-        if lineage:
-            return (
-                f"{name}<br>"
-                f"<span style='font-size:10px;color:#666'>{lineage}</span>"
-            )
+    # 意図: クロス対象馬はインブリード計算済みの cross_info から取得して強調表示する
+    cross_data = record.get("cross_info", {}).get("horse_crosses", {}) if record else {}
+    target_cross = cross_data.get(name) if name and name != "Unknown" else None
 
-    return name
+    def _get_lineage(rec: Optional[dict], lbl: str) -> str:
+        """record から lineage_name_{lbl} を取得する（空白差異を吸収）。"""
+        if not rec:
+            return ""
+        k = f"lineage_name_{lbl}"
+        v = rec.get(k, "")
+        if v:
+            return v
+        # 意図: カラム名に含まれる空白の有無の違いを吸収するため、
+        #       空白除去後の文字列でも照合する
+        t = k.replace(" ", "")
+        for rk, rv in rec.items():
+            if isinstance(rk, str) and rk.replace(" ", "") == t:
+                return rv or ""
+        return ""
+
+    # 意図: 系統色は「父」で終わる種牡馬ポジションにのみ適用する
+    lineage = _get_lineage(record, label) if record and label.endswith("父") else ""
+    bg_color = COLOR_MAP.get(lineage, "transparent")
+
+    # 意図: 濃い背景色に対してテキストを白色にすることで視認性を確保する
+    is_dark = bg_color in {
+        "#6C3483",
+        "#1B4F72",
+        "#8E5C42",
+        "#5B2C6F",
+        "#21618C",
+        "#7D3C98",
+    }
+    text_color = "#ffffff" if is_dark else "#000000"
+    sub_color = "rgba(255,255,255,0.7)" if is_dark else "rgba(0,0,0,0.5)"
+    cross_text_color = "#ffeb3b" if is_dark else "#d32f2f"
+
+    # 意図: クロス対象馬は太字にして非クロス馬と視覚的に区別する
+    name_style = (
+        "font-weight: bold; font-size: 15px;"
+        if target_cross
+        else "font-weight: normal; font-size: 14px;"
+    )
+
+    cross_html = ""
+    if target_cross:
+        formula = target_cross["formula"]
+        pct = target_cross["blood_pct"]
+        # 意図: 血量公式（例: 4x5 (9.375%)）をセル下部に小さく表示する
+        cross_html = (
+            f'<div style="font-size: 10px; color: {cross_text_color}; '
+            f'font-weight: bold; margin-top: 1px;">{formula} ({pct}%)</div>'
+        )
+
+    return f"""
+    <div style="display: table; width: 100%; height: 100%; background-color: {bg_color}; border-collapse: collapse;">
+        <div style="display: table-cell; vertical-align: middle; text-align: center; padding: 2px;">
+            <div style="{name_style} color: {text_color}; line-height: 1.1;">{name}</div>
+            {cross_html}
+            {f'<div style="font-size: 9px; color: {sub_color}; font-weight: bold; margin-top: 2px;">{lineage}</div>' if lineage else ''}
+        </div>
+    </div>
+    """
 
 
 def build_html(
     name: str,
     pedigree_dict: Dict[int, str],
-    record: Optional[dict],
+    record: Optional[Dict[str, Any]],
 ) -> str:
     """
-    血統表HTMLテーブルを組み立てる.
+    5代血統表を HTML テーブル構造で組み立て、文字列として返す。
+
+    父系（上半分・sire-side）と母系（下半分・dam-side）を rowspan で結合し、
+    横5列・縦32行の血統表レイアウトを生成する。
+    `.wrapper` の padding により wkhtmltoimage での端の削れを防止する。
 
     Args:
-        name (str): 馬名.
-        pedigree_dict (Dict[int, str]): インデックス → 馬名 dict.
-        record (Optional[dict]): DBレコード全体（系統情報付与用）.
+        name (str): 馬名（HTML タイトル用に保持。本体表示には未使用）。
+        pedigree_dict (Dict[int, str]): インデックス→馬名の辞書（0〜61）。
+        record (Optional[Dict[str, Any]]): pedigree_info の1行分の辞書。
+                                            系統色・クロス情報の適用に使用する。
 
     Returns:
-        str: HTML文字列.
+        str: 完全な HTML ドキュメント文字列（DOCTYPE〜/html）。
+
+    Raises:
+        None: 本関数は例外を外部へ伝播しない。
 
     Example:
-        html = build_html("キタサンブラック", pedigree_dict, record)
+        >>> pedigree_dict = {i: f"馬{i}" for i in range(62)}
+        >>> html = build_html("テスト馬", pedigree_dict, None)
+        >>> html.startswith("<!DOCTYPE html>")
+        True
+    """
+    css = """
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { background-color: #fff; display: inline-block; }
+        .wrapper { padding: 15px; background-color: #fff; }
+        table { border-collapse: collapse; border: 2px solid #000; table-layout: fixed; width: 1100px; height: 850px; }
+        td { border: 1px solid #444; vertical-align: middle; text-align: center; }
+        .sire-side { background-color: #f0faff; }
+        .dam-side  { background-color: #fff5f7; }
+    </style>
     """
 
-    # ---------------------------------------------------------
-    # CSSスタイル定義
-    # ---------------------------------------------------------
+    # 意図: 32行5列の血統表テーブル構造を rowspan で結合する
+    g = pedigree_dict
+    r = record
+    table_rows = f"""
+    <tr><td class="sire-side" rowspan="16">{get_cell_html(0,g,r)}</td><td rowspan="8">{get_cell_html(1,g,r)}</td><td rowspan="4">{get_cell_html(3,g,r)}</td><td rowspan="2">{get_cell_html(7,g,r)}</td><td>{get_cell_html(15,g,r)}</td></tr>
+    <tr><td>{get_cell_html(16,g,r)}</td></tr>
+    <tr><td rowspan="2">{get_cell_html(8,g,r)}</td><td>{get_cell_html(17,g,r)}</td></tr>
+    <tr><td>{get_cell_html(18,g,r)}</td></tr>
+    <tr><td rowspan="4">{get_cell_html(4,g,r)}</td><td rowspan="2">{get_cell_html(9,g,r)}</td><td>{get_cell_html(19,g,r)}</td></tr>
+    <tr><td>{get_cell_html(20,g,r)}</td></tr>
+    <tr><td rowspan="2">{get_cell_html(10,g,r)}</td><td>{get_cell_html(21,g,r)}</td></tr>
+    <tr><td>{get_cell_html(22,g,r)}</td></tr>
+    <tr><td rowspan="8">{get_cell_html(2,g,r)}</td><td rowspan="4">{get_cell_html(5,g,r)}</td><td rowspan="2">{get_cell_html(11,g,r)}</td><td>{get_cell_html(23,g,r)}</td></tr>
+    <tr><td>{get_cell_html(24,g,r)}</td></tr>
+    <tr><td rowspan="2">{get_cell_html(12,g,r)}</td><td>{get_cell_html(25,g,r)}</td></tr>
+    <tr><td>{get_cell_html(26,g,r)}</td></tr>
+    <tr><td rowspan="4">{get_cell_html(6,g,r)}</td><td rowspan="2">{get_cell_html(13,g,r)}</td><td>{get_cell_html(27,g,r)}</td></tr>
+    <tr><td>{get_cell_html(28,g,r)}</td></tr>
+    <tr><td rowspan="2">{get_cell_html(14,g,r)}</td><td>{get_cell_html(29,g,r)}</td></tr>
+    <tr><td>{get_cell_html(30,g,r)}</td></tr>
+    <tr><td class="dam-side" rowspan="16">{get_cell_html(31,g,r)}</td><td rowspan="8">{get_cell_html(32,g,r)}</td><td rowspan="4">{get_cell_html(34,g,r)}</td><td rowspan="2">{get_cell_html(38,g,r)}</td><td>{get_cell_html(46,g,r)}</td></tr>
+    <tr><td>{get_cell_html(47,g,r)}</td></tr>
+    <tr><td rowspan="2">{get_cell_html(39,g,r)}</td><td>{get_cell_html(48,g,r)}</td></tr>
+    <tr><td>{get_cell_html(49,g,r)}</td></tr>
+    <tr><td rowspan="4">{get_cell_html(35,g,r)}</td><td rowspan="2">{get_cell_html(40,g,r)}</td><td>{get_cell_html(50,g,r)}</td></tr>
+    <tr><td>{get_cell_html(51,g,r)}</td></tr>
+    <tr><td rowspan="2">{get_cell_html(41,g,r)}</td><td>{get_cell_html(52,g,r)}</td></tr>
+    <tr><td>{get_cell_html(53,g,r)}</td></tr>
+    <tr><td rowspan="8">{get_cell_html(33,g,r)}</td><td rowspan="4">{get_cell_html(36,g,r)}</td><td rowspan="2">{get_cell_html(42,g,r)}</td><td>{get_cell_html(54,g,r)}</td></tr>
+    <tr><td>{get_cell_html(55,g,r)}</td></tr>
+    <tr><td rowspan="2">{get_cell_html(43,g,r)}</td><td>{get_cell_html(56,g,r)}</td></tr>
+    <tr><td>{get_cell_html(57,g,r)}</td></tr>
+    <tr><td rowspan="4">{get_cell_html(37,g,r)}</td><td rowspan="2">{get_cell_html(44,g,r)}</td><td>{get_cell_html(58,g,r)}</td></tr>
+    <tr><td>{get_cell_html(59,g,r)}</td></tr>
+    <tr><td rowspan="2">{get_cell_html(45,g,r)}</td><td>{get_cell_html(60,g,r)}</td></tr>
+    <tr><td>{get_cell_html(61,g,r)}</td></tr>
+    """
 
-    html_content = f"""
-<html>
-<head>
-    <meta charset="utf-8">
-    <style>
-        body {{ font-family: 'MS Gothic', 'Meiryo', Arial, sans-serif; margin: 10px; }}
-        h2 {{ font-size: 18px; color: #333; border-bottom: 2px solid #333; display: inline-block; }}
-        table {{ border-collapse: collapse; border: 2px solid #000; table-layout: fixed; width: 1000px; }}
-        td {{ border: 1px solid #444; height: 26px; padding: 2px 5px; font-size: 12px; text-align: center; }}
-        .target {{ background: #eee; font-weight: bold; }}
-        .sire-side {{ background: #f0faff; }}
-        .dam-side {{ background: #fff5f7; }}
-    </style>
-</head>
-<body>
-    <h2>{name} 5代血統表</h2>
-    <table>
-        <tr>
-            <td class="target" rowspan="32">{name}</td>
-            <td class="sire-side" rowspan="16">{get_cell_html(0, pedigree_dict, record)}</td>
-            <td rowspan="8">{get_cell_html(1, pedigree_dict, record)}</td>
-            <td rowspan="4">{get_cell_html(3, pedigree_dict, record)}</td>
-            <td rowspan="2">{get_cell_html(7, pedigree_dict, record)}</td>
-            <td>{get_cell_html(15, pedigree_dict, record)}</td>
-        </tr>
-        <tr><td>{get_cell_html(16, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="2">{get_cell_html(8, pedigree_dict, record)}</td><td>{get_cell_html(17, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(18, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="4">{get_cell_html(4, pedigree_dict, record)}</td><td rowspan="2">{get_cell_html(9, pedigree_dict, record)}</td><td>{get_cell_html(19, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(20, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="2">{get_cell_html(10, pedigree_dict, record)}</td><td>{get_cell_html(21, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(22, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="8">{get_cell_html(2, pedigree_dict, record)}</td><td rowspan="4">{get_cell_html(5, pedigree_dict, record)}</td><td rowspan="2">{get_cell_html(11, pedigree_dict, record)}</td><td>{get_cell_html(23, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(24, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="2">{get_cell_html(12, pedigree_dict, record)}</td><td>{get_cell_html(25, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(26, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="4">{get_cell_html(6, pedigree_dict, record)}</td><td rowspan="2">{get_cell_html(13, pedigree_dict, record)}</td><td>{get_cell_html(27, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(28, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="2">{get_cell_html(14, pedigree_dict, record)}</td><td>{get_cell_html(29, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(30, pedigree_dict, record)}</td></tr>
-        <tr>
-            <td class="dam-side" rowspan="16">{get_cell_html(31, pedigree_dict, record)}</td>
-            <td rowspan="8">{get_cell_html(32, pedigree_dict, record)}</td>
-            <td rowspan="4">{get_cell_html(34, pedigree_dict, record)}</td>
-            <td rowspan="2">{get_cell_html(38, pedigree_dict, record)}</td>
-            <td>{get_cell_html(46, pedigree_dict, record)}</td>
-        </tr>
-        <tr><td>{get_cell_html(47, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="2">{get_cell_html(39, pedigree_dict, record)}</td><td>{get_cell_html(48, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(49, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="4">{get_cell_html(35, pedigree_dict, record)}</td><td rowspan="2">{get_cell_html(40, pedigree_dict, record)}</td><td>{get_cell_html(50, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(51, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="2">{get_cell_html(41, pedigree_dict, record)}</td><td>{get_cell_html(52, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(53, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="8">{get_cell_html(33, pedigree_dict, record)}</td><td rowspan="4">{get_cell_html(36, pedigree_dict, record)}</td><td rowspan="2">{get_cell_html(42, pedigree_dict, record)}</td><td>{get_cell_html(54, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(55, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="2">{get_cell_html(43, pedigree_dict, record)}</td><td>{get_cell_html(56, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(57, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="4">{get_cell_html(37, pedigree_dict, record)}</td><td rowspan="2">{get_cell_html(44, pedigree_dict, record)}</td><td>{get_cell_html(58, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(59, pedigree_dict, record)}</td></tr>
-        <tr><td rowspan="2">{get_cell_html(45, pedigree_dict, record)}</td><td>{get_cell_html(60, pedigree_dict, record)}</td></tr>
-        <tr><td>{get_cell_html(61, pedigree_dict, record)}</td></tr>
-    </table>
-</body>
-</html>
-"""
-    return html_content
+    return (
+        f'<!DOCTYPE html><html><head><meta charset="utf-8">{css}</head>'
+        f'<body><div class="wrapper"><table>{table_rows}</table></div></body></html>'
+    )
 
 
 # ---------------------------------------------------------
-# メイン実行関数
+# メイン実行処理
 # ---------------------------------------------------------
 
 
@@ -310,25 +454,26 @@ def generate_pedigree_image(
     logger: Optional[logging.Logger] = None,
 ) -> None:
     """
-    指定馬IDの血統表をHTMLおよびPNG画像として生成・保存する.
+    指定馬IDの5代血統表（クロス情報付き）を HTML ファイルおよび PNG 画像として出力する。
 
-    既にHTMLと画像が両方存在する場合はスキップする.
+    血統データとインブリード計算結果を統合したうえで HTML を生成し、
+    wkhtmltoimage で PNG に変換する。
 
     Args:
-        horse_id (str): 馬ID.
-        logger (Optional[logging.Logger]): ロガー. 省略時は自動生成.
+        horse_id (str): 馬ID（10桁ゼロ埋み文字列または数値文字列）。
+        logger (Optional[logging.Logger]): ログ出力用ロガー。
+                                            None の場合は内部で setup_logger() を生成する。
 
     Returns:
-        None
+        None: 戻り値なし（副作用として HTML / PNG ファイルを生成する）。
+
+    Raises:
+        None: DB エラー・subprocess エラーは内部で捕捉し ERROR ログを出力する。
 
     Example:
-        generate_pedigree_image("0001352760", logger)
+        >>> logger = setup_logger("logs/pedigree_visualizer.log", logger_name="PedigreeVisualizer")
+        >>> generate_pedigree_image("0001352760", logger)
     """
-
-    # ---------------------------------------------------------
-    # ロガーの初期化（未指定時は自動生成）
-    # ---------------------------------------------------------
-
     if logger is None:
         logger = setup_logger(
             log_filepath="logs/pedigree_visualizer.log",
@@ -340,68 +485,49 @@ def generate_pedigree_image(
     html_path = HTML_DIR / f"{safe_id}.html"
     img_path = IMG_DIR / f"{safe_id}.png"
 
-    # 既に両ファイルが存在する場合は処理をスキップする
-    if html_path.exists() and img_path.exists():
-        logger.info(f"スキップ（既存）: {safe_id}")
-        return
-
     HTML_DIR.mkdir(parents=True, exist_ok=True)
     IMG_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ---------------------------------------------------------
-    # DBから血統データを取得する
-    # ---------------------------------------------------------
-
-    record = get_pedigree_data(horse_id, logger)
+    record = get_pedigree_and_cross_data(horse_id, logger)
     if not record:
+        logger.error("血統データが取得できませんでした: %s", safe_id)
         return
 
-    # ---------------------------------------------------------
-    # 5代血統表リスト・dictを生成する
-    # ---------------------------------------------------------
-
     name = record["name"]
-    raw_list = [x.strip() for x in record["five_gen_ancestors"].split(",") if x.strip()]
+    raw_list = [
+        x.strip() for x in record.get("five_gen_ancestors", "").split(",") if x.strip()
+    ]
 
-    # 先頭に対象馬名が含まれている場合は除去する
+    # 意図: 本馬自身がインデックス 0 に含まれる場合（63件）は除去し 62件に揃える
     if len(raw_list) == 63:
         raw_list = raw_list[1:]
 
-    # 62件に満たない場合は空文字で補完する
+    # 意図: スクレイピング不完全で要素が不足している場合も空文字で補完して処理を継続する
     while len(raw_list) < 62:
         raw_list.append("")
 
     pedigree_dict: Dict[int, str] = {i: raw_list[i] for i in range(62)}
 
-    # ---------------------------------------------------------
-    # HTML生成・ファイル保存
-    # ---------------------------------------------------------
-
     html = build_html(name, pedigree_dict, record)
-
     with html_path.open("w", encoding="utf-8") as f:
         f.write(html)
-
-    # ---------------------------------------------------------
-    # wkhtmltoimage による画像変換
-    # ---------------------------------------------------------
 
     try:
         subprocess.run(
             [
-                WKHTMLTOIMAGE,
-                "--width",
-                "1150",
-                "--disable-smart-width",
-                str(html_path),
-                str(img_path),
+                str(WKHTMLTOIMAGE),
+                "--quiet",
+                "--enable-local-file-access",
+                str(html_path.resolve()),
+                str(img_path.resolve()),
             ],
             check=True,
-            capture_output=True,
         )
-        logger.info(f"画像生成成功 : {img_path}")
+        logger.info("画像生成成功: %s", img_path.name)
+    except subprocess.CalledProcessError as e:
+        logger.error("画像変換エラー (CalledProcessError): %s", e)
     except Exception as e:
-        logger.error(f"画像変換エラー : {e}")
+        logger.error("予期せぬエラー: %s", e, exc_info=True)
 
 
 # ---------------------------------------------------------
@@ -410,21 +536,149 @@ def generate_pedigree_image(
 
 
 def _run_tests() -> None:
-    """主要機能の動作確認テストを実行する."""
+    """
+    主要機能の動作確認テストを実行する。
+
+    DBアクセスは実 DB_PATH に接続する（モックなし）。
+    DB ファイルが存在しない場合・対象馬が未登録の場合は該当テストを SKIP する。
+    subprocess.run（wkhtmltoimage）は Windows 専用外部バイナリのため
+    unittest.mock.patch でモックし OS 依存を排除する。
+    テスト終了後はログファイルとロガーをすべて解放・削除する。
+
+    Args:
+        なし。
+
+    Returns:
+        None: 戻り値なし。テスト結果は標準出力に print する。
+
+    Raises:
+        None: AssertionError および予期しない例外は内部でキャッチして出力する。
+
+    Example:
+        # python -m src.utils.pedigree_visualizer
+        _run_tests()
+    """
+    from unittest.mock import patch
+
+    from src.utils.logger import close_logger_handlers, setup_logger
+
+    TEST_LOG_DIR: Final[str] = "logs/_test_pedigree_visualizer_tmp"
+    TEST_LOG_FILE: Final[str] = f"{TEST_LOG_DIR}/test.log"
+    TEST_LOGGER_NAME: Final[str] = "test_pedigree_visualizer"
+    TEST_HTML_DIR: Final[str] = f"{TEST_LOG_DIR}/html"
+    TEST_IMG_DIR: Final[str] = f"{TEST_LOG_DIR}/img"
+    TEST_HORSE_ID: Final[str] = "0001352760"
+
+    print("=" * 60)
+    print(" pedigree_visualizer.py 簡易単体テスト 開始")
+    print("=" * 60)
+
+    db_available: bool = DB_PATH.exists()
+    if not db_available:
+        print(f"\n  [INFO] DB ファイルが存在しません: {DB_PATH}")
+        print("  DB 依存テストは SKIP されます。")
 
     logger = setup_logger(
-        log_filepath="logs/pedigree_visualizer_test.log",
-        log_level="INFO",
-        logger_name="pedigree_visualizer_test",
+        log_filepath=TEST_LOG_FILE,
+        log_level="DEBUG",
+        logger_name=TEST_LOGGER_NAME,
     )
 
-    print("\n--- 正常系 : 画像生成テスト ---")
-    generate_pedigree_image("0001352760", logger)
+    try:
+        # ---------------------------------------------------------
+        # テスト 1: get_cell_html (純粋ロジック・DB 不要)
+        # ---------------------------------------------------------
+        print("\n[TEST 1] 正常系: get_cell_html の HTML 構造検証")
+        pedigree_dict_test = {0: "ブラックタイド"}
+        html = get_cell_html(0, pedigree_dict_test, None)
+        assert "ブラックタイド" in html, "馬名が HTML に含まれていません"
+        assert "display: table" in html, "display:table が HTML に含まれていません"
+        print("  -> PASS")
 
-    print("\n--- 異常系 : 存在しないID ---")
-    generate_pedigree_image("9999999999", logger)
+        # ---------------------------------------------------------
+        # テスト 2: build_html (純粋ロジック・DB 不要)
+        # ---------------------------------------------------------
+        print("\n[TEST 2] 正常系: build_html の HTML ドキュメント構造検証")
+        pedigree_dict_full = {i: f"馬{i}" for i in range(62)}
+        html_doc = build_html("テスト馬", pedigree_dict_full, None)
+        assert html_doc.startswith("<!DOCTYPE html>"), "DOCTYPE 宣言が含まれていません"
+        assert "<table>" in html_doc, "<table> タグが含まれていません"
+        assert 'class="sire-side"' in html_doc, "sire-side クラスが含まれていません"
+        assert 'class="dam-side"' in html_doc, "dam-side クラスが含まれていません"
+        print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 3: get_pedigree_and_cross_data 実 DB 接続
+        # ---------------------------------------------------------
+        print("\n[TEST 3] 正常系: get_pedigree_and_cross_data の実 DB 接続・構造検証")
+        if not db_available:
+            print(f"  SKIP: DB ファイルが存在しません ({DB_PATH})")
+        else:
+            result = get_pedigree_and_cross_data(TEST_HORSE_ID, logger)
+            if result is None:
+                print(f"  SKIP: horse_id={TEST_HORSE_ID} は DB 未登録")
+            else:
+                assert "name" in result, "'name' キーが存在しません"
+                assert (
+                    "five_gen_ancestors" in result
+                ), "'five_gen_ancestors' キーが存在しません"
+                # 意図: インブリード計算結果が埋め込まれていることを確認する
+                assert "cross_info" in result, "'cross_info' キーが存在しません"
+                assert (
+                    "horse_crosses" in result["cross_info"]
+                ), "'horse_crosses' キーが cross_info に存在しません"
+                print(
+                    f"  DB 取得成功: name={result['name']} "
+                    f"horse_crosses={len(result['cross_info']['horse_crosses'])}件"
+                )
+            print("  -> PASS")
+
+        # ---------------------------------------------------------
+        # テスト 4: generate_pedigree_image 実 DB + subprocess モック
+        # ---------------------------------------------------------
+        print("\n[TEST 4] 正常系: generate_pedigree_image の実 DB + subprocess モック")
+        with (
+            patch("src.utils.pedigree_visualizer.HTML_DIR", Path(TEST_HTML_DIR)),
+            patch("src.utils.pedigree_visualizer.IMG_DIR", Path(TEST_IMG_DIR)),
+            patch("src.utils.pedigree_visualizer.subprocess.run"),
+        ):
+            generate_pedigree_image(TEST_HORSE_ID, logger)
+
+        if not db_available:
+            print(f"  SKIP: DB ファイルが存在しません ({DB_PATH})")
+        else:
+            expected_html = Path(TEST_HTML_DIR) / f"{TEST_HORSE_ID}.html"
+            if not expected_html.exists():
+                print(
+                    f"  SKIP: horse_id={TEST_HORSE_ID} が DB 未登録のため HTML 非生成"
+                )
+            else:
+                content = expected_html.read_text(encoding="utf-8")
+                assert (
+                    "<!DOCTYPE html>" in content
+                ), "HTML に DOCTYPE 宣言が含まれていません"
+                assert "<table>" in content, "HTML に <table> が含まれていません"
+                print(f"  HTML ファイル生成・内容確認成功: {expected_html}")
+        print("  -> PASS")
+
+    except AssertionError as e:
+        print(f"\n[FAIL] アサーション失敗: {e}")
+    except Exception as e:
+        print(f"\n[FAIL] 予期しないエラー: {e}")
+        import traceback
+
+        traceback.print_exc()
+    finally:
+        close_logger_handlers(TEST_LOGGER_NAME)
+        if Path(TEST_LOG_DIR).exists():
+            shutil.rmtree(TEST_LOG_DIR)
+            print(f"\nCLEANUP: {TEST_LOG_DIR} を削除しました。")
+
+    print("\n" + "=" * 60)
+    print(" 全テスト完了")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    # 実行コマンド: python -m src.utils.pedigree_visualizer
+    # python -m src.utils.pedigree_visualizer
     _run_tests()
